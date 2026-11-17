@@ -151,6 +151,12 @@ impl ScopedRunner {
                     "/proc".to_string(),
                     "--dev".to_string(),
                     "/dev".to_string(),
+                    "--dir".to_string(),
+                    "/dev/shm".to_string(),
+                    "--size".to_string(),
+                    "67108864".to_string(),
+                    "--tmpfs".to_string(),
+                    "/dev/shm".to_string(),
                     "--size".to_string(),
                     "1073741824".to_string(),
                     "--tmpfs".to_string(),
@@ -238,19 +244,25 @@ impl ScopedRunner {
                 }
             }
 
-            // Standard runtime mounts: proc, dev, 1 GiB bounded tmpfs over /tmp
+            // Standard runtime mounts: proc, dev, bounded /dev/shm (64 MiB), bounded /tmp (1 GiB)
             bwrap_args.extend([
                 "--proc".to_string(),
                 "/proc".to_string(),
                 "--dev".to_string(),
                 "/dev".to_string(),
+                "--dir".to_string(),
+                "/dev/shm".to_string(),
+                "--size".to_string(),
+                "67108864".to_string(),
+                "--tmpfs".to_string(),
+                "/dev/shm".to_string(),
                 "--size".to_string(),
                 "1073741824".to_string(),
                 "--tmpfs".to_string(),
                 "/tmp".to_string(),
             ]);
 
-            // Mask $HOME completely with a fresh empty tmpfs to prevent secret laundering
+            // Mask $HOME completely with a 64 MiB bounded tmpfs to prevent secret laundering and resource exhaustion
             if let Ok(home) = std::env::var("HOME") {
                 let home_path = PathBuf::from(&home);
                 if let Some(parent) = home_path.parent() {
@@ -259,6 +271,8 @@ impl ScopedRunner {
                 bwrap_args.extend([
                     "--dir".to_string(),
                     home_path.to_string_lossy().into_owned(),
+                    "--size".to_string(),
+                    "67108864".to_string(),
                     "--tmpfs".to_string(),
                     home_path.to_string_lossy().into_owned(),
                 ]);

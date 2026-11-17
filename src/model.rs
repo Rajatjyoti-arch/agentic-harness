@@ -170,6 +170,8 @@ struct OllamaChatResponse {
     done_reason: Option<String>,
     #[serde(default)]
     prompt_eval_count: Option<usize>,
+    #[serde(default)]
+    eval_count: Option<usize>,
 }
 
 impl Model for OllamaModel {
@@ -225,11 +227,20 @@ impl Model for OllamaModel {
                             }));
                         }
                     }
-                    Message::ToolResult { content, .. } => {
-                        messages_payload.push(json!({
-                            "role": "tool",
-                            "content": content,
-                        }));
+                    Message::ToolResult {
+                        tool_call_id,
+                        tool_name,
+                        content,
+                        ..
+                    } => {
+                        let mut map = serde_json::Map::new();
+                        map.insert("role".to_string(), json!("tool"));
+                        map.insert("content".to_string(), json!(content));
+                        map.insert("tool_call_id".to_string(), json!(tool_call_id));
+                        if let Some(name) = tool_name {
+                            map.insert("name".to_string(), json!(name));
+                        }
+                        messages_payload.push(Value::Object(map));
                     }
                 }
             }
@@ -315,6 +326,7 @@ impl Model for OllamaModel {
                 tool_calls,
                 stop_reason,
                 prompt_eval_count: chat_res.prompt_eval_count,
+                eval_count: chat_res.eval_count,
             })
         })
     }

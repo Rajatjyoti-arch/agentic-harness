@@ -11,6 +11,12 @@ use tokio_util::sync::CancellationToken;
 pub enum AgentError {
     #[error("Model failure: {0}")]
     Model(#[from] ModelError),
+
+    #[error("Baseline test compilation failed: {0}")]
+    BaselineCompilationFailed(String),
+
+    #[error("Baseline test suite is empty")]
+    BaselineEmpty,
 }
 
 /// Configuration for automated verification checks executed after mutating tool actions.
@@ -99,25 +105,45 @@ pub async fn run_with_verification(
     // Baseline Test Suite Collection (captured from pristine workspace before any model edits)
     let mut baseline_test_names = std::collections::HashSet::new();
     if let Some(v_config) = verification.as_ref().filter(|v| v.enabled)
+        && v_config.command == "cargo"
         && let Some(run_tool) = tools.iter().find(|t| t.name() == "run_command")
     {
-        let baseline_call = ToolCall {
-            id: "baseline_verification".to_string(),
+        let baseline_list_call = ToolCall {
+            id: "baseline_list".to_string(),
             name: "run_command".to_string(),
             arguments: json!({
-                "cmd": v_config.command,
-                "args": v_config.args
+                "cmd": "cargo",
+                "args": ["test", "--offline", "--locked", "--", "--list"]
             }),
         };
-        if let PolicyDecision::AllowCommand(_) = policy.evaluate(&baseline_call, run_tool.as_ref())
-            && let Ok(base_out) = run_tool.run(baseline_call.arguments).await
+        if let PolicyDecision::AllowCommand(_) =
+            policy.evaluate(&baseline_list_call, run_tool.as_ref())
         {
-            baseline_test_names = extract_test_names(&base_out);
-            println!(
-                "[Agent Trace] Pristine baseline test suite captured ({} tests: {:?})",
-                baseline_test_names.len(),
-                baseline_test_names
-            );
+            match run_tool.run(baseline_list_call.arguments).await {
+                Ok(base_list_out) => {
+                    if (base_list_out.contains("Exit Code:")
+                        && !base_list_out.contains("Exit Code: 0"))
+                        || base_list_out.contains("error[E")
+                        || base_list_out.contains("error: could not compile")
+                    {
+                        println!(
+                            "[Agent Trace] Baseline compilation failed:\n{}",
+                            base_list_out
+                        );
+                        return Err(AgentError::BaselineCompilationFailed(base_list_out));
+                    }
+                    baseline_test_names = extract_test_names_from_list(&base_list_out);
+                    if baseline_test_names.is_empty() {
+                        return Err(AgentError::BaselineEmpty);
+                    }
+                    println!(
+                        "[Agent Trace] Pristine baseline test suite captured ({} tests: {:?})",
+                        baseline_test_names.len(),
+                        baseline_test_names
+                    );
+                }
+                Err(err) => return Err(AgentError::BaselineCompilationFailed(err)),
+            }
         }
     }
 
@@ -182,22 +208,53 @@ pub async fn run_with_verification(
                 tool_calls,
                 stop_reason,
                 prompt_eval_count,
+                eval_count,
             } => {
-                if let Some(count) = prompt_eval_count {
-                    println!("[Agent Trace] Turn {}: prompt_eval_count: {}", turn, count);
-                    // Abort with distinct StopReason::ContextNearLimit above 90% of num_ctx (8192 * 0.9 = 7372)
-                    if *count > (8192 * 9 / 10) {
-                        println!(
-                            "[Agent Trace] Turn {}: ABORT: prompt_eval_count ({}) exceeded 90% of num_ctx (7372). Stopping with ContextNearLimit.",
-                            turn, count
-                        );
-                        history.push(assistant_msg.clone());
-                        return Ok(AgentOutput {
-                            history,
-                            stop_reason: StopReason::ContextNearLimit,
-                            turns_executed: turn,
-                        });
-                    }
+                let p_str = prompt_eval_count
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let e_str = eval_count
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                // Local estimate: serialized bytes / 3 over messages + tool schemas
+                let messages_bytes = serde_json::to_string(&history)
+                    .map(|s| s.len())
+                    .unwrap_or(0);
+                let tools_bytes = serde_json::to_string(&tool_definitions)
+                    .map(|s| s.len())
+                    .unwrap_or(0);
+                let local_estimate = (messages_bytes + tools_bytes) / 3;
+
+                let reported_total = match (prompt_eval_count, eval_count) {
+                    (Some(p), Some(e)) => Some(p + e),
+                    (Some(p), None) => Some(*p),
+                    (None, Some(e)) => Some(*e),
+                    (None, None) => None,
+                };
+
+                let effective_tokens = match reported_total {
+                    Some(rep) => rep.max(local_estimate),
+                    None => local_estimate,
+                };
+
+                println!(
+                    "[Agent Trace] Turn {}: Token usage: prompt_eval_count={}, eval_count={}, local_estimate={}, effective_tokens={}",
+                    turn, p_str, e_str, local_estimate, effective_tokens
+                );
+
+                // Abort with distinct StopReason::ContextNearLimit above 90% of num_ctx (8192 * 0.9 = 7372)
+                if effective_tokens > (8192 * 9 / 10) {
+                    println!(
+                        "[Agent Trace] Turn {}: ABORT: effective_tokens ({}) exceeded 90% of num_ctx (7372). Stopping with ContextNearLimit.",
+                        turn, effective_tokens
+                    );
+                    history.push(assistant_msg.clone());
+                    return Ok(AgentOutput {
+                        history,
+                        stop_reason: StopReason::ContextNearLimit,
+                        turns_executed: turn,
+                    });
                 }
 
                 if let Some(text) = content {
@@ -270,8 +327,9 @@ pub async fn run_with_verification(
                                         turn, reason
                                     );
                                     // Append error observation and continue loop
-                                    history.push(Message::tool_result(
+                                    history.push(Message::tool_result_full(
                                         &tool_call.id,
+                                        Some(tool_call.name.clone()),
                                         format!("Policy violation: {}", reason),
                                         true,
                                     ));
@@ -281,8 +339,9 @@ pub async fn run_with_verification(
                                         "[Agent Trace] Turn {}: POLICY DECISION: REQUIRE APPROVAL -> {}",
                                         turn, reason
                                     );
-                                    history.push(Message::tool_result(
+                                    history.push(Message::tool_result_full(
                                         &tool_call.id,
+                                        Some(tool_call.name.clone()),
                                         format!("Policy requires human approval: {}", reason),
                                         true,
                                     ));
@@ -297,8 +356,9 @@ pub async fn run_with_verification(
                                             "[Agent Trace] Turn {}: POLICY HARD REJECTION: {}",
                                             turn, err_msg
                                         );
-                                        history.push(Message::tool_result(
+                                        history.push(Message::tool_result_full(
                                             &tool_call.id,
+                                            Some(tool_call.name.clone()),
                                             err_msg,
                                             true,
                                         ));
@@ -321,8 +381,9 @@ pub async fn run_with_verification(
                                                 duration,
                                                 out.len()
                                             );
-                                            history.push(Message::tool_result(
+                                            history.push(Message::tool_result_full(
                                                 &tool_call.id,
+                                                Some(tool_call.name.clone()),
                                                 out,
                                                 false,
                                             ));
@@ -348,8 +409,9 @@ pub async fn run_with_verification(
                                             } else {
                                                 format!("Tool execution error: {}", err)
                                             };
-                                            history.push(Message::tool_result(
+                                            history.push(Message::tool_result_full(
                                                 &tool_call.id,
+                                                Some(tool_call.name.clone()),
                                                 feedback,
                                                 true,
                                             ));
@@ -363,8 +425,9 @@ pub async fn run_with_verification(
                                             "[Agent Trace] Turn {}: POLICY HARD REJECTION: {}",
                                             turn, err_msg
                                         );
-                                        history.push(Message::tool_result(
+                                        history.push(Message::tool_result_full(
                                             &tool_call.id,
+                                            Some(tool_call.name.clone()),
                                             err_msg,
                                             true,
                                         ));
@@ -485,8 +548,9 @@ pub async fn run_with_verification(
                                                 }
                                             }
 
-                                            history.push(Message::tool_result(
+                                            history.push(Message::tool_result_full(
                                                 &tool_call.id,
+                                                Some(tool_call.name.clone()),
                                                 out,
                                                 verification_failed,
                                             ));
@@ -529,8 +593,9 @@ pub async fn run_with_verification(
                                             } else {
                                                 format!("Tool execution error: {}", err)
                                             };
-                                            history.push(Message::tool_result(
+                                            history.push(Message::tool_result_full(
                                                 &tool_call.id,
+                                                Some(tool_call.name.clone()),
                                                 feedback,
                                                 true,
                                             ));
@@ -542,7 +607,12 @@ pub async fn run_with_verification(
                         None => {
                             let msg = format!("Error: tool '{}' not found", tool_call.name);
                             println!("[Agent Trace] Turn {}: {}", turn, msg);
-                            history.push(Message::tool_result(&tool_call.id, msg, true));
+                            history.push(Message::tool_result_full(
+                                &tool_call.id,
+                                Some(tool_call.name.clone()),
+                                msg,
+                                true,
+                            ));
                         }
                     }
                 }
@@ -579,6 +649,23 @@ pub fn extract_test_names(output: &str) -> std::collections::HashSet<String> {
             let name = rest[..idx].trim();
             if !name.is_empty() {
                 names.insert(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Extracts all test names from `cargo test -- --list` output.
+///
+/// Parses lines ending with `: test` (e.g. `test_foo: test` or `tests::test_foo: test`).
+pub fn extract_test_names_from_list(output: &str) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(name) = trimmed.strip_suffix(": test") {
+            let test_name = name.trim();
+            if !test_name.is_empty() {
+                names.insert(test_name.to_string());
             }
         }
     }

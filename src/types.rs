@@ -30,11 +30,15 @@ pub enum Message {
         stop_reason: Option<StopReason>,
         #[serde(skip_serializing_if = "Option::is_none")]
         prompt_eval_count: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        eval_count: Option<usize>,
     },
     /// Result returned to the model after tool execution.
     #[serde(rename = "tool")]
     ToolResult {
         tool_call_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
         content: String,
         #[serde(default)]
         is_error: bool,
@@ -60,6 +64,7 @@ impl Message {
             tool_calls,
             stop_reason: None,
             prompt_eval_count: None,
+            eval_count: None,
         }
     }
 
@@ -73,6 +78,7 @@ impl Message {
             tool_calls,
             stop_reason,
             prompt_eval_count: None,
+            eval_count: None,
         }
     }
 
@@ -86,6 +92,7 @@ impl Message {
             tool_calls,
             stop_reason: None,
             prompt_eval_count,
+            eval_count: None,
         }
     }
 
@@ -95,6 +102,7 @@ impl Message {
             tool_calls: Vec::new(),
             stop_reason: None,
             prompt_eval_count: None,
+            eval_count: None,
         }
     }
 
@@ -105,6 +113,21 @@ impl Message {
     ) -> Self {
         Self::ToolResult {
             tool_call_id: tool_call_id.into(),
+            tool_name: None,
+            content: content.into(),
+            is_error,
+        }
+    }
+
+    pub fn tool_result_full(
+        tool_call_id: impl Into<String>,
+        tool_name: Option<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
+        Self::ToolResult {
+            tool_call_id: tool_call_id.into(),
+            tool_name,
             content: content.into(),
             is_error,
         }

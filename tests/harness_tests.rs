@@ -340,6 +340,7 @@ async fn test_t5_policy_deny_produces_error_observation_and_loop_continues() {
             tool_call_id,
             content,
             is_error,
+            ..
         } => {
             assert_eq!(tool_call_id, "call_1_0");
             assert!(
@@ -2201,6 +2202,7 @@ async fn test_c2_distinct_tool_call_ids_and_correlated_results() {
             tool_call_id,
             content,
             is_error,
+            ..
         } => {
             assert_eq!(tool_call_id, "call_1_0");
             assert!(!*is_error);
@@ -2214,6 +2216,7 @@ async fn test_c2_distinct_tool_call_ids_and_correlated_results() {
             tool_call_id,
             content,
             is_error,
+            ..
         } => {
             assert_eq!(tool_call_id, "call_1_1");
             assert!(!*is_error);
@@ -2338,6 +2341,7 @@ async fn test_c4_context_near_limit_aborts_agent_loop() {
         }],
         stop_reason: None,
         prompt_eval_count: Some(7500),
+        eval_count: None,
     };
 
     let model = MockModel::with_responses(vec![turn1_call]);
@@ -2352,6 +2356,321 @@ async fn test_c4_context_near_limit_aborts_agent_loop() {
             .history
             .iter()
             .all(|m| !matches!(m, Message::ToolResult { .. }))
+    );
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_i1a_deleting_passing_baseline_test_fails_verification() {
+    let workspace = setup_test_workspace("i1a_delete_baseline");
+    let runner = Arc::new(ScopedRunner::new(&workspace));
+    let policy: Arc<dyn Policy> = Arc::new(DefaultPolicy::new(&workspace));
+    let cancel = CancellationToken::new();
+
+    let cargo_toml = r#"[package]
+name = "fixture_i1a"
+version = "0.1.0"
+edition = "2024"
+"#;
+    let pristine_lib = r#"
+pub fn add(a: i64, b: i64) -> i64 { a + b }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_alpha() {
+        assert_eq!(add(2, 2), 4);
+    }
+    #[test]
+    fn test_beta() {
+        assert_eq!(add(3, 3), 6);
+    }
+}
+"#;
+    fs::write(workspace.join("Cargo.toml"), cargo_toml).unwrap();
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(workspace.join("src/lib.rs"), pristine_lib).unwrap();
+
+    let tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(WriteFileTool::new(&workspace)),
+        Box::new(RunCommandTool::new(
+            runner.clone(),
+            policy.clone(),
+            cancel.clone(),
+        )),
+    ];
+
+    let turn1_call = Message::assistant(
+        Some("Deleting test_beta to pass easily".to_string()),
+        vec![ToolCall {
+            id: "call_del".to_string(),
+            name: "write_file".to_string(),
+            arguments: json!({
+                "path": "src/lib.rs",
+                "content": "pub fn add(a: i64, b: i64) -> i64 { a + b }\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn test_alpha() {\n        assert_eq!(add(2, 2), 4);\n    }\n}\n"
+            }),
+        }],
+    );
+
+    let model = MockModel::with_responses(vec![turn1_call]);
+    let v_config = VerificationConfig {
+        enabled: true,
+        command: "cargo".to_string(),
+        args: vec!["test".to_string(), "--offline".to_string()],
+        max_repairs: 1,
+    };
+
+    let output = run_agent_with_verification(
+        &model,
+        &tools,
+        "Maintain all unit tests",
+        policy.as_ref(),
+        Some(v_config),
+        3,
+        cancel,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.stop_reason, StopReason::RepairExhausted);
+    match &output.history[3] {
+        Message::ToolResult {
+            content, is_error, ..
+        } => {
+            assert!(*is_error);
+            assert!(content.contains("AUTOMATED VERIFICATION FAILED - REPAIR REQUIRED"));
+        }
+        other => panic!("Expected ToolResult, got: {:?}", other),
+    }
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_i1b_non_compiling_baseline_refuses_to_start() {
+    let workspace = setup_test_workspace("i1b_non_compiling");
+    let runner = Arc::new(ScopedRunner::new(&workspace));
+    let policy: Arc<dyn Policy> = Arc::new(DefaultPolicy::new(&workspace));
+    let cancel = CancellationToken::new();
+
+    let cargo_toml = r#"[package]
+name = "fixture_i1b"
+version = "0.1.0"
+edition = "2024"
+"#;
+    let broken_lib = r#"
+pub fn broken() {
+    this is not valid rust code syntax at all!
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_something() {}
+}
+"#;
+    fs::write(workspace.join("Cargo.toml"), cargo_toml).unwrap();
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(workspace.join("src/lib.rs"), broken_lib).unwrap();
+
+    let tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(ReadFileTool::new(&workspace)),
+        Box::new(RunCommandTool::new(
+            runner.clone(),
+            policy.clone(),
+            cancel.clone(),
+        )),
+    ];
+
+    let model = MockModel::new();
+    let v_config = VerificationConfig {
+        enabled: true,
+        command: "cargo".to_string(),
+        args: vec!["test".to_string(), "--offline".to_string()],
+        max_repairs: 1,
+    };
+
+    let result = run_agent_with_verification(
+        &model,
+        &tools,
+        "Fix non-compiling baseline",
+        policy.as_ref(),
+        Some(v_config),
+        3,
+        cancel,
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "Expected agent to refuse to start on non-compiling baseline"
+    );
+    match result.unwrap_err() {
+        agentic_harness::AgentError::BaselineCompilationFailed(diag) => {
+            assert!(
+                diag.contains("error:") || diag.contains("error[E") || diag.contains("Exit Code:"),
+                "Expected compiler diagnostics, got: {}",
+                diag
+            );
+        }
+        other => panic!("Expected BaselineCompilationFailed error, got: {:?}", other),
+    }
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_i2_sandboxed_mounts_and_home_tmpfs_enospc() {
+    if !agentic_harness::is_bwrap_available() {
+        eprintln!("Skipping test_i2: bwrap not available");
+        return;
+    }
+
+    let workspace = setup_test_workspace("i2_home_mounts");
+    let runner = Arc::new(ScopedRunner::new(&workspace));
+    let policy: Arc<dyn Policy> = Arc::new(DefaultPolicy::new(&workspace));
+    let cancel = CancellationToken::new();
+
+    let cargo_toml = r#"[package]
+name = "fixture_i2"
+version = "0.1.0"
+edition = "2024"
+"#;
+    let src_lib = r#"
+pub fn check_mounts_and_overflow_home() -> Result<(), std::io::Error> {
+    use std::io::Write;
+    let mounts = std::fs::read_to_string("/proc/mounts")?;
+    eprintln!("[SANDBOX /proc/mounts]\n{}", mounts);
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let chunk = vec![0u8; 32 * 1024 * 1024];
+    for i in 0..3 {
+        let path = format!("{}/overflow_home_{}.bin", home, i);
+        let mut file = std::fs::File::create(&path)?;
+        file.write_all(&chunk)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_home_tmpfs_overflow_fails_enospc() {
+        let err = check_mounts_and_overflow_home().unwrap_err();
+        eprintln!("[enospc home verification] Caught error: {}", err);
+        assert_eq!(err.raw_os_error(), Some(28), "Expected ENOSPC (os error 28), got: {}", err);
+    }
+}
+"#;
+
+    fs::write(workspace.join("Cargo.toml"), cargo_toml).unwrap();
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(workspace.join("src/lib.rs"), src_lib).unwrap();
+
+    let tool = RunCommandTool::new(runner, policy, cancel);
+    let args = json!({
+        "cmd": "cargo",
+        "args": ["test", "--offline"]
+    });
+
+    let res = tool.run(args).await;
+    assert!(
+        res.is_ok(),
+        "Expected test asserting ENOSPC under $HOME to pass: {:?}",
+        res
+    );
+    let output = res.unwrap();
+    assert!(
+        output.contains("test tests::test_home_tmpfs_overflow_fails_enospc ... ok"),
+        "Output: {}",
+        output
+    );
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_i4_two_tool_results_serialization_order_and_tool_name() {
+    let workspace = setup_test_workspace("i4_serialization");
+    let policy = DefaultPolicy::new(&workspace);
+    let cancel = CancellationToken::new();
+
+    fs::write(workspace.join("a.txt"), "A").unwrap();
+    fs::write(workspace.join("b.txt"), "B").unwrap();
+
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadFileTool::new(&workspace))];
+
+    let turn1_call = Message::assistant(
+        Some("Reading a and b".to_string()),
+        vec![
+            ToolCall {
+                id: "call_1_0".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "a.txt" }),
+            },
+            ToolCall {
+                id: "call_1_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "b.txt" }),
+            },
+        ],
+    );
+    let turn2_resp = Message::assistant_text("Done");
+
+    let model = MockModel::with_responses(vec![turn1_call, turn2_resp]);
+    let output = run_agent(&model, &tools, "Read two files", &policy, 3, cancel)
+        .await
+        .unwrap();
+
+    let r1 = &output.history[3];
+    let r2 = &output.history[4];
+
+    match (r1, r2) {
+        (
+            Message::ToolResult {
+                tool_call_id: id1,
+                tool_name: name1,
+                content: c1,
+                ..
+            },
+            Message::ToolResult {
+                tool_call_id: id2,
+                tool_name: name2,
+                content: c2,
+                ..
+            },
+        ) => {
+            assert_eq!(id1, "call_1_0");
+            assert_eq!(name1.as_deref(), Some("read_file"));
+            assert_eq!(c1, "A");
+
+            assert_eq!(id2, "call_1_1");
+            assert_eq!(name2.as_deref(), Some("read_file"));
+            assert_eq!(c2, "B");
+        }
+        other => panic!("Expected two ToolResults in order, got: {:?}", other),
+    }
+
+    let serialized_turn = json!([
+        {
+            "role": "tool",
+            "name": "read_file",
+            "tool_call_id": "call_1_0",
+            "content": "A"
+        },
+        {
+            "role": "tool",
+            "name": "read_file",
+            "tool_call_id": "call_1_1",
+            "content": "B"
+        }
+    ]);
+    eprintln!(
+        "[I4 SERIALIZED /api/chat JSON for two tool results]\n{}",
+        serde_json::to_string_pretty(&serialized_turn).unwrap()
     );
 
     let _ = fs::remove_dir_all(&workspace);

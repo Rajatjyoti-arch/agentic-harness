@@ -58,8 +58,11 @@ When Bubblewrap (`bwrap`) is active:
 - **Isolated Workspace Mount & Persistence Channel Removal:**
   - The workspace root is mounted `--ro-bind`, with only `src/` mounted read-write.
   - `target/` is NOT mounted from the host workspace; `CARGO_TARGET_DIR` is redirected to `/tmp/target` in ephemeral tmpfs. This removed a persistence channel, preventing build-cache poisoning or persistent artifact planting across invocations.
-- **Bounded `/tmp` tmpfs:**
+- **Bounded `/tmp`, `$HOME`, and `/dev/shm` tmpfs:**
   - Bubblewrap mounts `/tmp` with `--size 1073741824 --tmpfs /tmp` (1 GiB ceiling), preventing disk or memory exhaustion from runaway sandboxed writes.
+  - Bubblewrap mounts `$HOME` with `--size 67108864 --tmpfs $HOME` (64 MiB ceiling).
+  - Bubblewrap mounts `/dev/shm` with `--dir /dev/shm --size 67108864 --tmpfs /dev/shm` (64 MiB ceiling).
+  - Bubblewrap's root `/` and `/dev` base mount are created internally by bwrap without user-specified size options; all user-accessible writable locations (`/tmp`, `$HOME`, `/dev/shm`, and `<workspace>/src`) are strictly size-capped or write-confined.
 - **Single Named Exception: Sandboxed Lockfile Generation (`src/exec.rs:89-173`):**
   - If a workspace contains `Cargo.toml` without a `Cargo.lock`, `ScopedRunner::execute_internal` pre-creates an empty `Cargo.lock` on the host and runs `cargo generate-lockfile --offline` in a dedicated bubblewrap jail with `--bind Cargo.lock` before executing user code.
   - This is an internal prerequisite required by `--locked` when `<workspace_root>` is mounted read-only. It only works for dependency-free crates because `--offline` forbids network access.
@@ -74,7 +77,7 @@ When Bubblewrap (`bwrap`) is active:
   - On timeout or `CancellationToken` cancellation, `libc::kill(-pgid, SIGKILL)` terminates the entire process group simultaneously, preventing orphan sleep processes.
   - Reaping via `child.wait().await` prevents zombie processes.
 - **POSIX Resource Limits (`setrlimit`):**
-  - `RLIMIT_AS`: 4 GiB virtual address space ceiling per process (default, configurable per runner). Note: `RLIMIT_AS` caps virtual address space (VIRT), NOT resident memory (RSS); modern Linux provides no kernel RSS cap via `setrlimit`.
+  - `RLIMIT_AS`: 4 GiB virtual address space ceiling per process (default, configurable per runner). RLIMIT_RSS is not enforced by the Linux kernel; a real RSS cap needs cgroup v2 memory.max; not implemented.
   - `RLIMIT_CPU`: 60s soft limit, 61s hard limit (`SIGKILL`).
   - `RLIMIT_FSIZE`: 64 MB maximum generated file size.
   - `RLIMIT_NPROC`: Inherited from the calling user and never raised (preventing privilege escalation while avoiding Linux `EAGAIN` fork failures).
