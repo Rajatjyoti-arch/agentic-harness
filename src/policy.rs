@@ -2,11 +2,38 @@ use crate::tool::Tool;
 use crate::types::ToolCall;
 use std::path::{Component, Path, PathBuf};
 
+/// Authorized command execution token with strictly private fields.
+/// The ONLY way to obtain an `AuthorizedCall` is via successful evaluation by a `Policy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedCall {
+    exe: String,
+    args: Vec<String>,
+}
+
+impl AuthorizedCall {
+    /// Internal constructor, accessible only within this crate during policy validation.
+    pub(crate) fn new(exe: String, args: Vec<String>) -> Self {
+        Self { exe, args }
+    }
+
+    /// Executable binary to invoke.
+    pub fn exe(&self) -> &str {
+        &self.exe
+    }
+
+    /// Arguments to supply to the executable.
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+}
+
 /// The verdict produced by a security policy gate before tool execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyDecision {
-    /// Tool invocation is allowed to proceed.
+    /// Tool invocation is allowed to proceed (for non-command tools: read_file, write_file, list_dir, domain tools).
     Allow,
+    /// Command execution is authorized; carries the unforgeable `AuthorizedCall` token.
+    AllowCommand(AuthorizedCall),
     /// Tool invocation is strictly blocked with a specific violation rationale.
     Deny(String),
     /// Tool invocation requires human confirmation before proceeding.
@@ -19,18 +46,15 @@ pub trait Policy: Send + Sync {
     fn evaluate(&self, call: &ToolCall, tool: &dyn Tool) -> PolicyDecision;
 }
 
-/// Permitted commands in the fail-closed allowlist v0.
-pub const ALLOWED_EXECUTABLES: &[&str] = &["cargo", "rustc", "git", "ls", "cat"];
+/// Permitted commands in the fail-closed allowlist.
+/// Restricted strictly to `cargo` and `rustc`. `cat`, `ls`, and `git` are removed.
+pub const ALLOWED_EXECUTABLES: &[&str] = &["cargo", "rustc"];
 
 /// Disallowed interpreters and script runners that provide arbitrary command execution surfaces.
 pub const BLOCKED_INTERPRETERS: &[&str] = &[
     "sh", "bash", "zsh", "csh", "tcsh", "dash", "ksh", "python", "python3", "python2", "node",
     "perl", "ruby", "php", "env", "xargs", "find",
 ];
-
-/// Allowed read-only subcommands for the `git` tool.
-pub const ALLOWED_GIT_SUBCOMMANDS: &[&str] =
-    &["status", "diff", "log", "rev-parse", "show", "branch"];
 
 /// Checks whether `bwrap` (bubblewrap sandbox utility) is present on system PATH.
 pub fn is_bwrap_available() -> bool {
@@ -48,7 +72,7 @@ pub fn is_bwrap_available() -> bool {
 }
 
 /// Production fail-closed security policy enforcing workspace filesystem jailing,
-/// strict command allowlists, and containerized bubblewrap confinement.
+/// strict command allowlists, write confinement to `src/`, and containerized bubblewrap confinement.
 #[derive(Debug, Clone)]
 pub struct DefaultPolicy {
     workspace_root: PathBuf,
@@ -100,34 +124,27 @@ impl DefaultPolicy {
             self.workspace_root.join(input_path)
         };
 
-        // 3. Lexical normalization (resolve `.` and `..`)
-        let normalized = normalize_path(&resolved);
+        // 3. Reject access to protected internal directories
+        for component in resolved.components() {
+            let comp_str = component.as_os_str().to_string_lossy();
+            if comp_str == ".git" {
+                return Err("Access to .git metadata directory is denied by policy".to_string());
+            }
+            if comp_str == ".env" || comp_str.starts_with(".env.") {
+                return Err("Access to .env secret files is denied by policy".to_string());
+            }
+        }
 
-        // Check if normalized path stays within workspace_root
+        // 4. Lexical containment check
+        let normalized = normalize_path(&resolved);
         if !normalized.starts_with(&self.canonical_workspace_root)
             && !normalized.starts_with(&self.workspace_root)
         {
             return Err(format!(
-                "Path traversal denied: '{}' resolves outside workspace jail '{}'",
+                "Path traversal denied: path '{}' escapes workspace jail '{}'",
                 raw_path,
                 self.workspace_root.display()
             ));
-        }
-
-        // 4. Protect critical metadata files and directories: .git, .env, .ssh
-        for comp in normalized.components() {
-            if let Component::Normal(os_str) = comp {
-                let s = os_str.to_string_lossy();
-                if s == ".git" || s.starts_with(".git/") {
-                    return Err("Access to .git internals is denied".to_string());
-                }
-                if s == ".env" || s.starts_with(".env.") {
-                    return Err("Access to .env environment files is denied".to_string());
-                }
-                if s == ".ssh" {
-                    return Err("Access to .ssh keys is denied".to_string());
-                }
-            }
         }
 
         // 5. Canonicalization and symlink escape verification
@@ -171,7 +188,8 @@ impl DefaultPolicy {
     }
 
     /// Evaluates executable and arguments against the fail-closed allowlist policy.
-    pub fn validate_command(&self, cmd: &str, args: &[String]) -> Result<(), String> {
+    /// Returns an unforgeable `AuthorizedCall` token on success.
+    pub fn validate_command(&self, cmd: &str, args: &[String]) -> Result<AuthorizedCall, String> {
         let trimmed_cmd = cmd.trim();
         if trimmed_cmd.is_empty() {
             return Err("Command cannot be empty".to_string());
@@ -191,41 +209,30 @@ impl DefaultPolicy {
             ));
         }
 
-        // 2. Strict executable allowlist check (Allowlist v0)
+        // 2. Strict executable allowlist check (cargo and rustc only)
         if !ALLOWED_EXECUTABLES.contains(&base_name) {
             return Err(format!(
-                "Executable '{}' is not on the policy allowlist: only {:?} are permitted",
+                "Executable '{}' is not on the policy allowlist: only {:?} are permitted. Use typed tools (read_file, write_file, list_dir) for file access.",
                 base_name, ALLOWED_EXECUTABLES
             ));
         }
 
-        // 3. For `git`, enforce read-only inspection subcommands only
-        if base_name == "git" {
-            let subcommand = args.first().map(|s| s.as_str()).unwrap_or("");
-            if !ALLOWED_GIT_SUBCOMMANDS.contains(&subcommand) {
-                return Err(format!(
-                    "Git subcommand '{}' is blocked by policy: only read-only subcommands {:?} are permitted",
-                    subcommand, ALLOWED_GIT_SUBCOMMANDS
-                ));
-            }
-        }
-
-        // 4. Confinement enforcement: if cargo or interpreters are invoked without bwrap, fail closed
-        if self.enforce_bwrap && !is_bwrap_available() && base_name == "cargo" {
+        // 3. Confinement enforcement: if cargo or rustc are invoked without bwrap, fail closed
+        if self.enforce_bwrap && !is_bwrap_available() {
             return Err(
-                "Execution of 'cargo' denied: bubblewrap (bwrap) isolation runtime is not available on PATH"
+                "Execution denied: bubblewrap (bwrap) container isolation is not available on PATH"
                     .to_string(),
             );
         }
 
-        Ok(())
+        Ok(AuthorizedCall::new(trimmed_cmd.to_string(), args.to_vec()))
     }
 }
 
 impl Policy for DefaultPolicy {
     fn evaluate(&self, call: &ToolCall, _tool: &dyn Tool) -> PolicyDecision {
         match call.name.as_str() {
-            "read_file" | "write_file" | "list_dir" => {
+            "read_file" | "list_dir" => {
                 if let Some(path_val) = call.arguments.get("path") {
                     if let Some(path_str) = path_val.as_str() {
                         match self.validate_path(path_str) {
@@ -238,6 +245,34 @@ impl Policy for DefaultPolicy {
                 } else if call.name == "list_dir" {
                     // list_dir defaults to "."
                     PolicyDecision::Allow
+                } else {
+                    PolicyDecision::Deny("Missing required argument 'path'".to_string())
+                }
+            }
+            "write_file" => {
+                if let Some(path_val) = call.arguments.get("path") {
+                    if let Some(path_str) = path_val.as_str() {
+                        match self.validate_path(path_str) {
+                            Ok(normalized) => {
+                                // Enforce verifier integrity: agent may write ONLY inside 'src/'
+                                let allowed_src = self.workspace_root.join("src");
+                                let allowed_src_canonical =
+                                    self.canonical_workspace_root.join("src");
+                                if !normalized.starts_with(&allowed_src)
+                                    && !normalized.starts_with(&allowed_src_canonical)
+                                {
+                                    PolicyDecision::Deny(
+                                        "Write access denied: agent is restricted to writing only within the 'src/' directory to preserve verifier and workspace integrity".to_string(),
+                                    )
+                                } else {
+                                    PolicyDecision::Allow
+                                }
+                            }
+                            Err(reason) => PolicyDecision::Deny(reason),
+                        }
+                    } else {
+                        PolicyDecision::Deny("Argument 'path' must be a valid string".to_string())
+                    }
                 } else {
                     PolicyDecision::Deny("Missing required argument 'path'".to_string())
                 }
@@ -261,7 +296,7 @@ impl Policy for DefaultPolicy {
                     .unwrap_or(empty_vec);
 
                 match self.validate_command(cmd, &args_vec) {
-                    Ok(_) => PolicyDecision::Allow,
+                    Ok(auth_call) => PolicyDecision::AllowCommand(auth_call),
                     Err(reason) => PolicyDecision::Deny(reason),
                 }
             }

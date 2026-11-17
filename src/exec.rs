@@ -1,4 +1,4 @@
-use crate::policy::is_bwrap_available;
+use crate::policy::{AuthorizedCall, is_bwrap_available};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
@@ -29,7 +29,7 @@ pub struct ExecutionOutput {
 }
 
 /// Bounded subprocess runner enforcing Linux resource limits, environment sanitization,
-/// output caps, optional containerized bubblewrap confinement, and process-group termination.
+/// output caps, minimal containerized bubblewrap confinement, and process-group termination.
 pub struct ScopedRunner {
     workspace_root: PathBuf,
     default_timeout: Duration,
@@ -66,10 +66,21 @@ impl ScopedRunner {
         self
     }
 
-    /// Executes a command within the sandboxed environment with cooperative cancellation.
+    /// Executes an authorized command within the sandboxed environment with cooperative cancellation.
     ///
-    /// Never invokes a shell parser: invokes `Command::new(program).args(args)` directly.
-    pub async fn run(
+    /// Accepts ONLY `&AuthorizedCall`, strictly guaranteeing that no unverified or raw commands
+    /// can be dispatched without traversing the policy gate.
+    pub async fn execute(
+        &self,
+        call: &AuthorizedCall,
+        cancel_token: &CancellationToken,
+    ) -> Result<ExecutionOutput, ExecutionError> {
+        self.execute_internal(call.exe(), call.args(), cancel_token)
+            .await
+    }
+
+    /// Internal execution engine. Never exposed outside this module.
+    async fn execute_internal(
         &self,
         program: &str,
         args: &[String],
@@ -77,33 +88,80 @@ impl ScopedRunner {
     ) -> Result<ExecutionOutput, ExecutionError> {
         // If bubblewrap is available and enabled, construct the sandboxed container command
         let (exec_program, exec_args) = if self.use_bwrap && is_bwrap_available() {
-            let mut bwrap_args = vec![
+            let mut bwrap_args = Vec::new();
+
+            // Minimal host layout: /usr read-only
+            bwrap_args.extend([
                 "--ro-bind".to_string(),
-                "/".to_string(),
-                "/".to_string(),
-                "--tmpfs".to_string(),
-                "/tmp".to_string(),
+                "/usr".to_string(),
+                "/usr".to_string(),
+            ]);
+
+            // Symlinks and system directories for /bin, /lib, /lib64
+            for path_str in &["/bin", "/lib", "/lib64"] {
+                let p = Path::new(path_str);
+                if let Ok(meta) = std::fs::symlink_metadata(p) {
+                    if meta.file_type().is_symlink() {
+                        if let Ok(target) = std::fs::read_link(p) {
+                            bwrap_args.extend([
+                                "--symlink".to_string(),
+                                target.to_string_lossy().to_string(),
+                                path_str.to_string(),
+                            ]);
+                        }
+                    } else if meta.is_dir() {
+                        bwrap_args.extend([
+                            "--ro-bind".to_string(),
+                            path_str.to_string(),
+                            path_str.to_string(),
+                        ]);
+                    }
+                }
+            }
+
+            // Minimal /etc read-only
+            if Path::new("/etc").exists() {
+                bwrap_args.extend([
+                    "--ro-bind".to_string(),
+                    "/etc".to_string(),
+                    "/etc".to_string(),
+                ]);
+            }
+
+            // Standard runtime mounts: proc, dev, tmpfs over /tmp
+            bwrap_args.extend([
                 "--proc".to_string(),
                 "/proc".to_string(),
                 "--dev".to_string(),
                 "/dev".to_string(),
+                "--tmpfs".to_string(),
+                "/tmp".to_string(),
+            ]);
+
+            // Mask $HOME completely with a fresh empty tmpfs to prevent secret laundering
+            if let Ok(home) = std::env::var("HOME") {
+                let home_path = PathBuf::from(&home);
+                if let Some(parent) = home_path.parent() {
+                    bwrap_args.extend(["--dir".to_string(), parent.to_string_lossy().into_owned()]);
+                }
+                bwrap_args.extend([
+                    "--dir".to_string(),
+                    home_path.to_string_lossy().into_owned(),
+                    "--tmpfs".to_string(),
+                    home_path.to_string_lossy().into_owned(),
+                ]);
+            }
+
+            // Mount designated workspace read-write
+            bwrap_args.extend([
                 "--bind".to_string(),
                 self.workspace_root.to_string_lossy().into_owned(),
                 self.workspace_root.to_string_lossy().into_owned(),
-                "--unshare-all".to_string(),
-                "--die-with-parent".to_string(),
                 "--chdir".to_string(),
                 self.workspace_root.to_string_lossy().into_owned(),
-            ];
-
-            // Mask sensitive host directories like ~/.ssh with empty tmpfs mounts
-            if let Ok(home) = std::env::var("HOME") {
-                let ssh_dir = Path::new(&home).join(".ssh");
-                if ssh_dir.exists() {
-                    bwrap_args.push("--tmpfs".to_string());
-                    bwrap_args.push(ssh_dir.to_string_lossy().into_owned());
-                }
-            }
+                "--unshare-all".to_string(),
+                "--die-with-parent".to_string(),
+            ]);
 
             bwrap_args.push("--".to_string());
             bwrap_args.push(program.to_string());
@@ -124,118 +182,113 @@ impl ScopedRunner {
         if let Ok(path) = std::env::var("PATH") {
             cmd.env("PATH", path);
         }
-        cmd.env("HOME", "/tmp");
-        cmd.env("LANG", "C.UTF-8");
-        cmd.env("TERM", "xterm-256color");
+        if let Ok(home) = std::env::var("HOME") {
+            cmd.env("HOME", home);
+        }
+        cmd.env("RUST_BACKTRACE", "1");
 
-        // 3. Process piping & kill-on-drop guard
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        cmd.kill_on_drop(true);
-
-        // 4. Unix process isolation via pre_exec (async-signal-safe calls only)
+        // 3. Process Group Leader & POSIX Resource Limits via pre_exec
         #[cfg(unix)]
         unsafe {
             cmd.pre_exec(|| {
-                // Form a dedicated process group where pgid == child pid
+                // Isolate child into its own process group to prevent orphan leaks
                 if libc::setpgid(0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
 
-                // RLIMIT_AS (Virtual Address Space): strict 2 GiB
-                let as_limit = libc::rlimit {
-                    rlim_cur: 2 * 1024 * 1024 * 1024,
-                    rlim_max: 2 * 1024 * 1024 * 1024,
-                };
-                libc::setrlimit(libc::RLIMIT_AS, &as_limit);
-
-                // RLIMIT_CPU: soft = 60s, hard = 61s (kernel fires SIGKILL on hard limit)
+                // RLIMIT_CPU: Soft = 60s, Hard = 61s
                 let cpu_limit = libc::rlimit {
                     rlim_cur: 60,
                     rlim_max: 61,
                 };
-                libc::setrlimit(libc::RLIMIT_CPU, &cpu_limit);
-
-                // RLIMIT_NPROC: Never raise inherited limit. In Linux, RLIMIT_NPROC is
-                // an aggregate count per real UID across all user sessions and desktop apps.
-                // We read inherited limit and never increase it.
-                let mut inherited_nproc = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                if libc::getrlimit(libc::RLIMIT_NPROC, &mut inherited_nproc) == 0 {
-                    libc::setrlimit(libc::RLIMIT_NPROC, &inherited_nproc);
+                if libc::setrlimit(libc::RLIMIT_CPU, &cpu_limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
                 }
 
-                // RLIMIT_FSIZE (Maximum generated file size): 64 MB
+                // RLIMIT_AS: 2 GiB virtual address space ceiling
+                let as_limit = libc::rlimit {
+                    rlim_cur: 2 * 1024 * 1024 * 1024,
+                    rlim_max: 2 * 1024 * 1024 * 1024,
+                };
+                let _ = libc::setrlimit(libc::RLIMIT_AS, &as_limit);
+
+                // RLIMIT_FSIZE: 64 MB maximum generated file size
                 let fsize_limit = libc::rlimit {
                     rlim_cur: 64 * 1024 * 1024,
                     rlim_max: 64 * 1024 * 1024,
                 };
-                libc::setrlimit(libc::RLIMIT_FSIZE, &fsize_limit);
+                let _ = libc::setrlimit(libc::RLIMIT_FSIZE, &fsize_limit);
+
+                // RLIMIT_NPROC: Read inherited process limit and never increase it
+                let mut current_nproc = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_NPROC, &mut current_nproc) == 0 {
+                    let _ = libc::setrlimit(libc::RLIMIT_NPROC, &current_nproc);
+                }
 
                 Ok(())
             });
         }
 
+        // Configure piped stdout and stderr for streaming truncation
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
         let start_time = Instant::now();
         let mut child = cmd.spawn()?;
 
-        #[cfg(unix)]
-        let child_pid = child
-            .id()
-            .ok_or_else(|| std::io::Error::other("Failed to retrieve child process ID"))?
-            as i32;
-
-        let stdout_pipe = child
-            .stdout
-            .take()
-            .ok_or_else(|| std::io::Error::other("Failed to capture stdout stream"))?;
-        let stderr_pipe = child
-            .stderr
-            .take()
-            .ok_or_else(|| std::io::Error::other("Failed to capture stderr stream"))?;
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
 
         let max_bytes = self.max_output_bytes;
 
-        // Asynchronously read bounded streams
-        let stdout_handle = tokio::spawn(async move {
+        // Async task to drain stdout up to max_output_bytes + 1 to detect truncation
+        let stdout_task = tokio::spawn(async move {
             let mut buf = Vec::new();
-            let _ = stdout_pipe
-                .take((max_bytes + 1) as u64)
-                .read_to_end(&mut buf)
-                .await;
+            if let Some(mut stream) = stdout_pipe {
+                let mut take = (&mut stream).take((max_bytes + 1) as u64);
+                let _ = take.read_to_end(&mut buf).await;
+            }
             buf
         });
 
-        let stderr_handle = tokio::spawn(async move {
+        // Async task to drain stderr up to max_output_bytes + 1 to detect truncation
+        let stderr_task = tokio::spawn(async move {
             let mut buf = Vec::new();
-            let _ = stderr_pipe
-                .take((max_bytes + 1) as u64)
-                .read_to_end(&mut buf)
-                .await;
+            if let Some(mut stream) = stderr_pipe {
+                let mut take = (&mut stream).take((max_bytes + 1) as u64);
+                let _ = take.read_to_end(&mut buf).await;
+            }
             buf
         });
 
-        let timeout = self.default_timeout;
+        // Get process ID for pgid targeting
+        let child_pid = child.id().map(|id| id as i32);
 
-        // Monitor execution with timeout and cancellation token
-        tokio::select! {
-            exit_res = child.wait() => {
-                let status = exit_res?;
+        // Wait with wall-clock timeout and cooperative cancellation token
+        let timeout_duration = self.default_timeout;
+        let wait_result = tokio::select! {
+            res = child.wait() => Ok(res?),
+            _ = tokio::time::sleep(timeout_duration) => Err(ExecutionError::Timeout(timeout_duration)),
+            _ = cancel_token.cancelled() => Err(ExecutionError::Cancelled),
+        };
+
+        match wait_result {
+            Ok(status) => {
                 let duration = start_time.elapsed();
-
-                let mut stdout_raw = stdout_handle.await.unwrap_or_default();
-                let mut stderr_raw = stderr_handle.await.unwrap_or_default();
+                let mut stdout_raw = stdout_task.await.unwrap_or_default();
+                let mut stderr_raw = stderr_task.await.unwrap_or_default();
 
                 let mut truncated = false;
                 if stdout_raw.len() > max_bytes {
-                    truncated = true;
                     stdout_raw.truncate(max_bytes);
+                    truncated = true;
                 }
                 if stderr_raw.len() > max_bytes {
-                    truncated = true;
                     stderr_raw.truncate(max_bytes);
+                    truncated = true;
                 }
 
                 Ok(ExecutionOutput {
@@ -246,23 +299,21 @@ impl ScopedRunner {
                     duration,
                 })
             }
-            _ = tokio::time::sleep(timeout) => {
-                // Timeout: Kill entire process group using negative PID
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(-child_pid, libc::SIGKILL);
+            Err(err) => {
+                // If timed out or cancelled, aggressively kill entire process group
+                if let Some(pid) = child_pid {
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                        libc::kill(pid, libc::SIGKILL);
+                    }
                 }
-                let _ = child.wait().await; // Reap child zombie
-                Err(ExecutionError::Timeout(timeout))
-            }
-            _ = cancel_token.cancelled() => {
-                // Cancellation: Kill entire process group
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(-child_pid, libc::SIGKILL);
-                }
+                // Reap the child to prevent zombies
                 let _ = child.wait().await;
-                Err(ExecutionError::Cancelled)
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+
+                Err(err)
             }
         }
     }

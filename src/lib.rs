@@ -12,7 +12,7 @@ pub use r#loop::{
 };
 pub use model::{BoxFuture, MockModel, Model, ModelError, OllamaModel};
 pub use policy::{
-    ALLOWED_EXECUTABLES, ALLOWED_GIT_SUBCOMMANDS, BLOCKED_INTERPRETERS, DefaultPolicy, Policy,
+    ALLOWED_EXECUTABLES, AuthorizedCall, BLOCKED_INTERPRETERS, DefaultPolicy, Policy,
     PolicyDecision, is_bwrap_available,
 };
 pub use tool::{

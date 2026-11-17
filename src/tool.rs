@@ -1,6 +1,7 @@
 use crate::exec::ScopedRunner;
 use crate::model::BoxFuture;
-use crate::types::ToolDefinition;
+use crate::policy::{Policy, PolicyDecision};
+use crate::types::{ToolCall, ToolDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -267,16 +268,22 @@ pub struct RunCommandArgs {
     pub args: Vec<String>,
 }
 
-/// Executes a shell command using `ScopedRunner` within resource, jail, and isolation limits.
+/// Executes an authorized shell command using `ScopedRunner` within resource, jail, and isolation limits.
 pub struct RunCommandTool {
     runner: Arc<ScopedRunner>,
+    policy: Arc<dyn Policy>,
     cancel_token: CancellationToken,
 }
 
 impl RunCommandTool {
-    pub fn new(runner: Arc<ScopedRunner>, cancel_token: CancellationToken) -> Self {
+    pub fn new(
+        runner: Arc<ScopedRunner>,
+        policy: Arc<dyn Policy>,
+        cancel_token: CancellationToken,
+    ) -> Self {
         Self {
             runner,
+            policy,
             cancel_token,
         }
     }
@@ -297,7 +304,7 @@ impl Tool for RunCommandTool {
             "properties": {
                 "cmd": {
                     "type": "string",
-                    "description": "Executable program to run (e.g., 'cargo', 'git')"
+                    "description": "Executable program to run (e.g., 'cargo', 'rustc')"
                 },
                 "args": {
                     "type": "array",
@@ -312,14 +319,25 @@ impl Tool for RunCommandTool {
 
     fn run<'a>(&'a self, args: Value) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async move {
-            let parsed: RunCommandArgs = serde_json::from_value(args)
+            let _parsed: RunCommandArgs = serde_json::from_value(args.clone())
                 .map_err(|e| format!("Invalid arguments for run_command: {}", e))?;
 
-            match self
-                .runner
-                .run(&parsed.cmd, &parsed.args, &self.cancel_token)
-                .await
-            {
+            let call = ToolCall {
+                id: "run_command_call".to_string(),
+                name: "run_command".to_string(),
+                arguments: args,
+            };
+
+            let decision = self.policy.evaluate(&call, self);
+            let auth_call = match decision {
+                PolicyDecision::AllowCommand(auth) => auth,
+                PolicyDecision::Deny(reason) => {
+                    return Err(format!("Policy violation: {}", reason));
+                }
+                _ => return Err("Execution disallowed by policy".to_string()),
+            };
+
+            match self.runner.execute(&auth_call, &self.cancel_token).await {
                 Ok(out) => {
                     let mut report = format!(
                         "Exit Code: {}\nDuration: {:?}\nTruncated: {}\n--- STDOUT ---\n{}\n--- STDERR ---\n{}",

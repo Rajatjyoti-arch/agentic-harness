@@ -181,8 +181,19 @@ pub async fn run_with_verification(
                                         true,
                                     ));
                                 }
-                                PolicyDecision::Allow => {
-                                    println!("[Agent Trace] Turn {}: POLICY DECISION: ALLOW", turn);
+                                PolicyDecision::Allow | PolicyDecision::AllowCommand(_) => {
+                                    if let PolicyDecision::AllowCommand(ref auth) = decision {
+                                        println!(
+                                            "[Agent Trace] Turn {}: POLICY DECISION: ALLOW COMMAND ({})",
+                                            turn,
+                                            auth.exe()
+                                        );
+                                    } else {
+                                        println!(
+                                            "[Agent Trace] Turn {}: POLICY DECISION: ALLOW",
+                                            turn
+                                        );
+                                    }
                                     let start = Instant::now();
                                     match tool.run(tool_call.arguments.clone()).await {
                                         Ok(mut out) => {
@@ -226,57 +237,72 @@ pub async fn run_with_verification(
                                                         turn, v_decision
                                                     );
 
-                                                    if v_decision == PolicyDecision::Allow {
-                                                        let v_start = Instant::now();
-                                                        match run_tool
-                                                            .run(verify_call.arguments)
-                                                            .await
-                                                        {
-                                                            Ok(v_out) => {
-                                                                let v_dur = v_start.elapsed();
-                                                                if v_out.contains("Exit Code: 0") {
-                                                                    println!(
-                                                                        "[Agent Trace] Turn {}: Automated verification PASSED in {:?}",
-                                                                        turn, v_dur
-                                                                    );
-                                                                    out.push_str(&format!("\n\n[AUTOMATED VERIFICATION PASSED in {:?}]\n{}", v_dur, v_out));
-                                                                } else {
+                                                    match v_decision {
+                                                        PolicyDecision::AllowCommand(_) => {
+                                                            let v_start = Instant::now();
+                                                            match run_tool
+                                                                .run(verify_call.arguments)
+                                                                .await
+                                                            {
+                                                                Ok(v_out) => {
+                                                                    let v_dur = v_start.elapsed();
+                                                                    if v_out
+                                                                        .contains("Exit Code: 0")
+                                                                    {
+                                                                        println!(
+                                                                            "[Agent Trace] Turn {}: Automated verification PASSED in {:?}",
+                                                                            turn, v_dur
+                                                                        );
+                                                                        out.push_str(&format!("\n\n[AUTOMATED VERIFICATION PASSED in {:?}]\n{}", v_dur, v_out));
+                                                                    } else {
+                                                                        repair_attempts += 1;
+                                                                        println!(
+                                                                            "[Agent Trace] Turn {}: Automated verification FAILED (Attempt {}/{}) in {:?}: Exit code non-zero",
+                                                                            turn,
+                                                                            repair_attempts,
+                                                                            v_config.max_repairs,
+                                                                            v_dur
+                                                                        );
+                                                                        out.push_str(&format!(
+                                                                            "\n\n[AUTOMATED VERIFICATION FAILED - REPAIR REQUIRED (Attempt {}/{})]\n{}",
+                                                                            repair_attempts, v_config.max_repairs, v_out
+                                                                        ));
+                                                                        verification_failed = true;
+                                                                    }
+                                                                }
+                                                                Err(v_err) => {
                                                                     repair_attempts += 1;
                                                                     println!(
-                                                                        "[Agent Trace] Turn {}: Automated verification FAILED (Attempt {}/{}) in {:?}: Exit code non-zero",
+                                                                        "[Agent Trace] Turn {}: Verification execution error (Attempt {}/{}): {}",
                                                                         turn,
                                                                         repair_attempts,
                                                                         v_config.max_repairs,
-                                                                        v_dur
+                                                                        v_err
                                                                     );
                                                                     out.push_str(&format!(
-                                                                                "\n\n[AUTOMATED VERIFICATION FAILED - REPAIR REQUIRED (Attempt {}/{})]\n{}",
-                                                                                repair_attempts, v_config.max_repairs, v_out
-                                                                            ));
+                                                                        "\n\n[AUTOMATED VERIFICATION FAILED - EXECUTION ERROR (Attempt {}/{})]\n{}",
+                                                                        repair_attempts, v_config.max_repairs, v_err
+                                                                    ));
                                                                     verification_failed = true;
                                                                 }
                                                             }
-                                                            Err(v_err) => {
-                                                                repair_attempts += 1;
-                                                                println!(
-                                                                    "[Agent Trace] Turn {}: Verification execution error (Attempt {}/{}): {}",
-                                                                    turn,
-                                                                    repair_attempts,
-                                                                    v_config.max_repairs,
-                                                                    v_err
-                                                                );
-                                                                out.push_str(&format!(
-                                                                            "\n\n[AUTOMATED VERIFICATION FAILED - EXECUTION ERROR (Attempt {}/{})]\n{}",
-                                                                            repair_attempts, v_config.max_repairs, v_err
-                                                                        ));
-                                                                verification_failed = true;
-                                                            }
                                                         }
-                                                    } else {
-                                                        println!(
-                                                            "[Agent Trace] Turn {}: Verification command blocked by policy",
-                                                            turn
-                                                        );
+                                                        PolicyDecision::Deny(reason) => {
+                                                            println!(
+                                                                "[Agent Trace] Turn {}: Verification command blocked by policy: {}",
+                                                                turn, reason
+                                                            );
+                                                            out.push_str(&format!(
+                                                                "\n\n[AUTOMATED VERIFICATION BLOCKED BY POLICY: {}]",
+                                                                reason
+                                                            ));
+                                                        }
+                                                        _ => {
+                                                            println!(
+                                                                "[Agent Trace] Turn {}: Verification command disallowed by policy",
+                                                                turn
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }

@@ -1,64 +1,78 @@
 # Threat Model & Security Architecture (`agentic-harness`)
 
 ## 1. Threat Profile
-The agent harness is designed to execute LLM-proposed actions against a local code repository. Language models frequently hallucinate destructive command arguments, attempt unauthorized file traversals, or invoke shell interpreters with arbitrary sub-shells.
+The agent harness executes LLM-proposed actions against a local code repository. Language models frequently hallucinate destructive command arguments, attempt unauthorized file traversals, invoke shell interpreters with arbitrary sub-shells, or perform reward hacking by rewriting tests to artificially pass verification.
 
-The goal of this security architecture is to provide **fail-closed, defense-in-depth isolation** where untrusted model outputs cannot escape declared workspace boundaries, corrupt the host system, or spawn unmonitored zombie processes.
-
----
-
-## 2. Security Boundaries: What IS Confined
-
-### A. Command & Execution Surfaces (`exec.rs`, `policy.rs`)
-1. **Direct `execve` Dispatch (Zero Shell Parsing):**
-   - Commands are never invoked via `sh -c "..."` string concatenation.
-   - Programs and argument vectors are passed directly to `tokio::process::Command::new(exe).args(vec)` translating directly into `execve(2)`. This eliminates shell injection, sub-shell interpolation, and metacharacter expansion vulnerabilities.
-2. **Fail-Closed Executable Allowlist:**
-   - Interpreters (`sh`, `bash`, `zsh`, `python`, `node`, `perl`, `ruby`, `env`, etc.) are explicitly blocked.
-   - Only audited tools on the allowlist (`cargo`, `rustc`, `git`, `ls`, `cat`) are permitted.
-   - For `git`, only read-only inspection subcommands (`status`, `diff`, `log`, `rev-parse`, `show`, `branch`) are allowed.
-3. **Containerized Linux Namespace Isolation (when `bwrap` is active):**
-   - Full container namespace unsharing (`--unshare-all`: mount, IPC, PID, network, UTS, cgroups).
-   - Root filesystem is mounted read-only (`--ro-bind / /`).
-   - Only the designated `workspace_root` is bind-mounted read-write (`--bind workspace workspace`).
-   - Private user credential directories (such as `~/.ssh`) are masked with empty tmpfs mounts.
-   - Loopback and external network access are completely unshared (zero network exfiltration surface).
-
-### B. Filesystem Jail & Atomic Operations (`tool.rs`, `policy.rs`)
-1. **Workspace Boundary Enforcement:**
-   - All file tools (`read_file`, `write_file`, `list_dir`) strictly validate paths against canonical `workspace_root`.
-   - Lexical `..` path traversals escaping the jail are rejected before touching disk.
-   - Symlinks resolving outside the jail are verified via `canonicalize()` and rejected.
-2. **Protected File Exclusions:**
-   - Access to `.git/` internals, `.env` secret files, and `~/.ssh` directories is strictly blocked by policy.
-3. **Atomic Writes with Unified Diff:**
-   - File edits write to a temporary file (`.tmp.<name>_<nanos>`) in the target directory and are swapped into place via atomic `rename(2)`.
-   - A line-by-line unified diff is returned to provide transparent auditability of all file modifications.
-
-### C. Process Tree Control & Resource Limits (`exec.rs`)
-1. **Orphan-Proof Process Group Cleanup:**
-   - `pre_exec` sets `setpgid(0, 0)` so the spawned process becomes its own process group leader.
-   - On timeout or cancellation (`CancellationToken`), `libc::kill(-pgid, SIGKILL)` terminates the entire process tree simultaneously.
-   - The child is reaped with `child.wait().await`, preventing zombie accumulation.
-2. **POSIX Resource Limits (`setrlimit`):**
-   - **`RLIMIT_AS` (Virtual Address Space):** Strict 2 GiB ceiling per process.
-   - **`RLIMIT_CPU`:** Soft limit = 60s, Hard limit = 61s (kernel automatically sends `SIGKILL` on hard limit).
-   - **`RLIMIT_FSIZE`:** 64 MB maximum generated file size.
-   - **`RLIMIT_NPROC`:** Reads inherited user process limits and never increases them (preventing privilege expansion while avoiding `EAGAIN` fork failure).
-3. **I/O Stream Caps:**
-   - Standard output and standard error are capped at 512 KB via `tokio::io::AsyncReadExt::take`. Truncation flags are explicitly recorded in execution output.
+The goal of this security architecture is to provide **fail-closed, type-enforced, kernel-isolated confinement** where untrusted model outputs cannot escape declared workspace boundaries, access host secrets, execute arbitrary commands, or tamper with test verification.
 
 ---
 
-## 3. What is NOT Confined (When `bwrap` is Absent)
+## 2. Security Architecture & Invariants
 
-> [!WARNING]
-> Without Linux user namespace support or `bwrap`, the runner falls back to unconfined execution under the calling user's UID.
+### A. Type-Enforced Execution Choke Point (`AuthorizedCall`)
+- **Unrepresentable Policy Bypass:**
+  - `AuthorizedCall` has strictly private fields (`exe: String, args: Vec<String>`) with no public constructor.
+  - The ONLY mechanism to construct an `AuthorizedCall` is via successful evaluation by a `Policy` (`validate_command` / `evaluate`).
+  - `ScopedRunner::execute(&self, call: &AuthorizedCall, cancel: &CancellationToken)` accepts ONLY `&AuthorizedCall`. All raw, untrusted execution entry points (`ScopedRunner::run`) have been deleted.
+  - Verification hooks call the identical `Policy::evaluate` method with zero exceptions. If verification is misconfigured with an interpreter (e.g. `sh`), it is denied at the gate, producing zero execution.
 
-If bubblewrap (`bwrap`) is absent:
-1. **Host Read Access:** Subprocesses run under the operator's UID and could read non-protected files accessible to that user on the host filesystem.
-2. **Network Access:** Subprocesses retain the host network interface and could transmit outbound packets.
-3. **Arbitrary Build Script Execution:** Running `cargo test` executes arbitrary procedural macros and build scripts (`build.rs`). Without `bwrap`, malicious crates or compromised dependencies run unconfined code on the host.
+### B. Shrunk Allowlist & Tool Boundary
+- **Command Allowlist:** Strictly limited to `["cargo", "rustc"]`.
+- **Elimination of `cat`, `ls`, `git`:**
+  - `cat` and `ls` circumvent path jailing because argument paths are not verified like file-tool paths.
+  - `git` has a broad attack surface: `git diff` can execute arbitrary external diff/pager drivers from repo config, and commands like `git checkout` or `git branch -D` mutate repository state.
+  - All file reads, writes, and directory listings MUST traverse the typed, path-jailed tools (`read_file`, `write_file`, `list_dir`).
+- **Interpreters Prohibited:** All shells and script interpreters (`sh`, `bash`, `zsh`, `python*`, `node`, `perl`, `ruby`, `env`) are blocked by policy.
 
-**Fail-Closed Policy Guard:**
-`DefaultPolicy` enforces `enforce_bwrap = true`. If `bwrap` is not detected on PATH, invoking `cargo` or interpreters is automatically **Denied**, preventing silent fallback to unconfined host execution.
+### C. Verifier Integrity & Reward Hacking Prevention
+- **Confinement of Agent Mutations to `src/`:**
+  - The agent's `write_file` tool is restricted strictly to writing within `<workspace>/src/`.
+  - Attempts to target `tests/`, `Cargo.toml`, or verification scripts outside `src/` are rejected with `PolicyDecision::Deny`.
+  - The test suite and verification logic remain completely immutable to the agent, eliminating the possibility of self-repair cheating (e.g. replacing failing assertions with `assert!(true)` or `exit 0`).
+
+### D. Minimal Sandbox Mounts & Secret Isolation
+When Bubblewrap (`bwrap`) is active:
+- **No Global Root Bind:** Dropped `--ro-bind / /`. The sandbox mounts ONLY what is strictly required:
+  - `--ro-bind /usr /usr`
+  - Symlinks / ro-binds for `/bin`, `/lib`, `/lib64`
+  - `--ro-bind /etc /etc`
+  - `--proc /proc --dev /dev --tmpfs /tmp`
+- **Masking of `$HOME` with tmpfs:**
+  - The user's home directory is masked by mounting an empty `--tmpfs` over `$HOME`. Host credentials (`~/.ssh`, `~/.aws`, `~/.config`, `.env`) do not exist inside the sandbox.
+  - Secret laundering (reading a host secret inside the sandbox and persisting it into the workspace) is physically impossible because the host filesystem outside `/usr` and `/etc` is not mounted.
+- **Isolated Workspace Mount:**
+  - Only the target workspace directory is bind-mounted read-write (`--bind <workspace> <workspace>`).
+- **Namespace Unsharing:**
+  - `--unshare-all` unshares mount, IPC, PID, network, UTS, and cgroup namespaces.
+  - Zero network exfiltration surface (network namespace is disconnected).
+  - `--die-with-parent` guarantees container cleanup if the parent harness process terminates.
+
+### E. Process Tree Lifecycle & Resource Limits
+- **Process Group Termination:**
+  - In `pre_exec`, `setpgid(0, 0)` isolates the child into a dedicated process group.
+  - On timeout or `CancellationToken` cancellation, `libc::kill(-pgid, SIGKILL)` terminates the entire process group simultaneously, preventing orphan sleep processes.
+  - Reaping via `child.wait().await` prevents zombie processes.
+- **POSIX Resource Limits (`setrlimit`):**
+  - `RLIMIT_AS`: 2 GiB virtual address space ceiling per process.
+  - `RLIMIT_CPU`: 60s soft limit, 61s hard limit (`SIGKILL`).
+  - `RLIMIT_FSIZE`: 64 MB maximum generated file size.
+  - `RLIMIT_NPROC`: Inherited from the calling user and never raised (preventing privilege escalation while avoiding Linux `EAGAIN` fork failures).
+- **Stream Caps:**
+  - Standard output and standard error are capped at 512 KB via `tokio::io::AsyncReadExt::take`.
+
+---
+
+## 3. Empirical Verification Evidence (bwrap & cargo test)
+
+- **`RLIMIT_AS` (2 GiB):** Empirically verified sufficient for `cargo test --offline` compilation and test execution on Rust 1.99.1 without triggering out-of-memory aborts.
+- **`CARGO_HOME` Location & Offline Operation:** When `$HOME` is masked with tmpfs, Cargo operates with `$HOME/.cargo` on tmpfs. In `--offline` mode on crates with vendored or cached dependencies, Cargo builds and tests without external network requests or host `$HOME` dependencies.
+- **Target Directory:** Build outputs write to `<workspace>/target`, which resides cleanly within the bind-mounted workspace.
+
+---
+
+## 4. Failure Modes Without Bubblewrap
+
+If `bwrap` is not installed on the host system:
+- `DefaultPolicy` enforces `enforce_bwrap = true`. Any invocation of `cargo` or `rustc` fails closed with:
+  `"Execution denied: bubblewrap (bwrap) container isolation is not available on PATH"`.
+- The runner NEVER silently degrades to unconfined host execution.
