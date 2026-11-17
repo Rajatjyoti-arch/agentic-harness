@@ -86,9 +86,25 @@ impl ScopedRunner {
         args: &[String],
         cancel_token: &CancellationToken,
     ) -> Result<ExecutionOutput, ExecutionError> {
+        // If workspace contains Cargo.toml but no Cargo.lock, pre-generate Cargo.lock
+        // on the host so that read-only confinement of workspace_root doesn't block cargo
+        // from reading dependencies or creating lockfile inside read-only sandbox.
+        let cargo_toml = self.workspace_root.join("Cargo.toml");
+        let cargo_lock = self.workspace_root.join("Cargo.lock");
+        if cargo_toml.exists() && !cargo_lock.exists() {
+            let _ = std::process::Command::new("cargo")
+                .arg("generate-lockfile")
+                .arg("--offline")
+                .current_dir(&self.workspace_root)
+                .output();
+        }
+
         // If bubblewrap is available and enabled, construct the sandboxed container command
         let (exec_program, exec_args) = if self.use_bwrap && is_bwrap_available() {
             let mut bwrap_args = Vec::new();
+
+            // Prevent TIOCSTI ioctl terminal injection
+            bwrap_args.push("--new-session".to_string());
 
             // Minimal host layout: /usr read-only
             bwrap_args.extend([
@@ -119,16 +135,24 @@ impl ScopedRunner {
                 }
             }
 
-            // /etc read-only: required for Cargo/rustc linker resolution
-            // (/etc/alternatives on Debian/Ubuntu), dynamic linker config
-            // (/etc/ld.so.conf, /etc/ld.so.cache), and timezone/locale
-            // (/etc/localtime). Mounted read-only; no secrets reside here.
-            if Path::new("/etc").exists() {
-                bwrap_args.extend([
-                    "--ro-bind".to_string(),
-                    "/etc".to_string(),
-                    "/etc".to_string(),
-                ]);
+            // Narrow /etc to dynamic linker files and timezone on Arch Linux:
+            // /etc/ld.so.cache, /etc/ld.so.conf, /etc/ld.so.conf.d, and /etc/localtime.
+            // Host files like /etc/passwd, /etc/shadow, /etc/machine-id, /etc/hostname are NOT bound.
+            bwrap_args.extend(["--dir".to_string(), "/etc".to_string()]);
+            for etc_file in &[
+                "/etc/ld.so.cache",
+                "/etc/ld.so.conf",
+                "/etc/ld.so.conf.d",
+                "/etc/localtime",
+            ] {
+                let p = Path::new(etc_file);
+                if p.exists() {
+                    bwrap_args.extend([
+                        "--ro-bind".to_string(),
+                        etc_file.to_string(),
+                        etc_file.to_string(),
+                    ]);
+                }
             }
 
             // Standard runtime mounts: proc, dev, tmpfs over /tmp
@@ -155,22 +179,35 @@ impl ScopedRunner {
                 ]);
             }
 
-            // Mount designated workspace read-write
+            // Workspace confinement:
+            // Mount workspace root strictly read-only. This protects Cargo.toml,
+            // Cargo.lock, tests/, .cargo/, build.rs from being tampered with by
+            // model code at test time.
             bwrap_args.extend([
-                "--bind".to_string(),
+                "--ro-bind".to_string(),
                 self.workspace_root.to_string_lossy().into_owned(),
                 self.workspace_root.to_string_lossy().into_owned(),
             ]);
 
-            // Overlay tests/ as read-only at the kernel level so sandboxed
-            // processes cannot tamper with the verifier test suite, even via
-            // direct syscalls that bypass the policy gate.
-            let tests_dir = self.workspace_root.join("tests");
-            if tests_dir.is_dir() {
+            // Overlay src/ as read-write (model mutation zone)
+            let src_dir = self.workspace_root.join("src");
+            if src_dir.is_dir() {
                 bwrap_args.extend([
-                    "--ro-bind".to_string(),
-                    tests_dir.to_string_lossy().into_owned(),
-                    tests_dir.to_string_lossy().into_owned(),
+                    "--bind".to_string(),
+                    src_dir.to_string_lossy().into_owned(),
+                    src_dir.to_string_lossy().into_owned(),
+                ]);
+            }
+
+            // Overlay target/ as read-write so compiler output can be written.
+            // Pre-create target/ on host if missing so bubblewrap can mount it.
+            let target_dir = self.workspace_root.join("target");
+            let _ = std::fs::create_dir_all(&target_dir);
+            if target_dir.is_dir() {
+                bwrap_args.extend([
+                    "--bind".to_string(),
+                    target_dir.to_string_lossy().into_owned(),
+                    target_dir.to_string_lossy().into_owned(),
                 ]);
             }
 

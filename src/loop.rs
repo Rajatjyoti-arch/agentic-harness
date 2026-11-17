@@ -27,7 +27,12 @@ impl Default for VerificationConfig {
         Self {
             enabled: true,
             command: "cargo".to_string(),
-            args: vec!["test".to_string(), "--quiet".to_string()],
+            args: vec![
+                "test".to_string(),
+                "--quiet".to_string(),
+                "--offline".to_string(),
+                "--locked".to_string(),
+            ],
             max_repairs: 3,
         }
     }
@@ -464,15 +469,18 @@ pub async fn run_with_verification(
 
 /// Parses the libtest summary from verification output.
 ///
-/// Returns `true` only when the output contains a valid libtest run:
-/// 1. Every suite that ran (`running N tests` with N > 0) has a matching
-///    summary line `test result: ok. N passed; 0 failed`.
-/// 2. At least one test suite ran with N > 0.
-/// 3. No test suite reported FAILED or has un-summarized/missing tests.
+/// Validates:
+/// 1. Command exit code is 0 (if reported in output).
+/// 2. For each test suite reported in stdout:
+///    - `running N tests` declares N expected tests.
+///    - Exactly N individual tests match `test <name> ... ok` with distinct names.
+///    - The suite summary `test result: ok. N passed; 0 failed` confirms N passed and 0 failed.
+/// 3. At least one suite with N > 0 completed successfully.
+/// 4. No suite failed or was truncated prematurely without its summary line.
 ///
 /// A process that exits 0 without completing libtest (e.g., via `std::process::exit(0)`)
-/// will either lack the summary line or have a mismatch between tests run and tests passed,
-/// and is strictly rejected as FAILED.
+/// or prints forged summary lines without matching per-test execution records
+/// is strictly rejected as FAILED.
 pub fn verify_libtest_summary(output: &str) -> bool {
     // If output contains an exit code marker, ensure it is 0
     if output.contains("Exit Code:") && !output.contains("Exit Code: 0") {
@@ -480,6 +488,7 @@ pub fn verify_libtest_summary(output: &str) -> bool {
     }
 
     let mut current_suite_expected: Option<usize> = None;
+    let mut current_suite_names = std::collections::HashSet::new();
     let mut total_passed = 0usize;
     let mut completed_suites = 0usize;
 
@@ -499,6 +508,17 @@ pub fn verify_libtest_summary(output: &str) -> bool {
                 return false;
             }
             current_suite_expected = Some(count);
+            current_suite_names.clear();
+        }
+
+        // Per-test-name matching: "test <name> ... ok"
+        if let Some(rest) = trimmed.strip_prefix("test ")
+            && let Some(name) = rest.strip_suffix(" ... ok")
+        {
+            let test_name = name.trim();
+            if !test_name.is_empty() && !current_suite_names.insert(test_name.to_string()) {
+                return false; // Duplicate test name report
+            }
         }
 
         // Detect summary line: "test result: ok. N passed; 0 failed; ..."
@@ -519,13 +539,14 @@ pub fn verify_libtest_summary(output: &str) -> bool {
 
                     if let (Some(passed), Some(0)) = (passed_count, failed_count) {
                         if let Some(expected) = current_suite_expected
-                            && passed != expected
+                            && (passed != expected || current_suite_names.len() != expected)
                         {
                             return false;
                         }
                         total_passed += passed;
                         completed_suites += 1;
                         current_suite_expected = None;
+                        current_suite_names.clear();
                     } else {
                         return false;
                     }

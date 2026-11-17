@@ -1483,3 +1483,219 @@ fn test_variance_under_disbursement() {
 
     let _ = fs::remove_dir_all(&workspace);
 }
+
+#[tokio::test]
+async fn test_f1_workspace_cargo_toml_ro_src_rw_confinement() {
+    let workspace = setup_test_workspace("f1_ro_cargo");
+    let policy = DefaultPolicy::new(&workspace);
+    let runner = ScopedRunner::new(&workspace).with_bwrap(true);
+    let cancel = CancellationToken::new();
+
+    fs::create_dir_all(workspace.join("src")).unwrap();
+
+    let cargo_toml_content = r#"[package]
+name = "confinement_test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tamper_cargo"
+path = "src/main.rs"
+"#;
+    fs::write(workspace.join("Cargo.toml"), cargo_toml_content).unwrap();
+
+    fs::write(
+        workspace.join("src/main.rs"),
+        r#"use std::fs::{self, OpenOptions};
+use std::io::ErrorKind;
+
+fn main() {
+    // 1. Attempt to overwrite Cargo.toml -> MUST FAIL WITH EROFS
+    let res = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open("Cargo.toml");
+
+    match res {
+        Ok(_) => panic!("Tampering Cargo.toml succeeded! Workspace root was NOT mounted read-only!"),
+        Err(e) => {
+            let is_erofs = e.kind() == ErrorKind::ReadOnlyFilesystem
+                || e.raw_os_error() == Some(30) // EROFS on Linux
+                || e.raw_os_error() == Some(13) // EACCES on Linux
+                || e.to_string().contains("Read-only file system");
+            assert!(is_erofs, "Expected EROFS for Cargo.toml write, got: {:?}", e);
+            println!("CARGO_TOML_EROFS_VERIFIED: {}", e);
+        }
+    }
+
+    // 2. Control: writing inside src/ MUST SUCCEED (read-write overlay)
+    fs::write("src/control_write.txt", "CONTROL_OK").expect("Write inside src/ failed!");
+    println!("SRC_CONTROL_WRITE_SUCCEEDED");
+}
+"#,
+    )
+    .unwrap();
+
+    // Prebuild so bwrap runs the binary directly
+    let prebuild_auth = policy
+        .validate_command(
+            "cargo",
+            &[
+                "build".to_string(),
+                "--bin".to_string(),
+                "tamper_cargo".to_string(),
+            ],
+        )
+        .unwrap();
+    let _ = runner.execute(&prebuild_auth, &cancel).await.unwrap();
+
+    let auth_call = policy
+        .validate_command(
+            "cargo",
+            &[
+                "run".to_string(),
+                "--bin".to_string(),
+                "tamper_cargo".to_string(),
+            ],
+        )
+        .unwrap();
+    let output = runner.execute(&auth_call, &cancel).await.unwrap();
+
+    assert_eq!(output.exit_code, Some(0));
+    assert!(
+        output.stdout.contains("CARGO_TOML_EROFS_VERIFIED"),
+        "Output missing EROFS confirmation: {}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains("SRC_CONTROL_WRITE_SUCCEEDED"),
+        "Output missing control confirmation: {}",
+        output.stdout
+    );
+
+    // Verify Cargo.toml remained untouched on host
+    let current_toml = fs::read_to_string(workspace.join("Cargo.toml")).unwrap();
+    assert_eq!(current_toml, cargo_toml_content);
+
+    // Verify control write succeeded in src/
+    let control_content = fs::read_to_string(workspace.join("src/control_write.txt")).unwrap();
+    assert_eq!(control_content, "CONTROL_OK");
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_f4_forged_summary_line_fails_verification() {
+    let workspace = setup_test_workspace("f4_forge");
+    let policy = Arc::new(DefaultPolicy::new(&workspace));
+    let runner = Arc::new(ScopedRunner::new(&workspace).with_bwrap(true));
+    let cancel = CancellationToken::new();
+
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::create_dir_all(workspace.join("tests")).unwrap();
+
+    fs::write(
+        workspace.join("Cargo.toml"),
+        r#"[package]
+name = "forge_fixture"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        workspace.join("tests/reconcile_test.rs"),
+        r#"use forge_fixture::calculate_variance;
+
+#[test]
+fn test_variance_under_disbursement() {
+    assert_eq!(calculate_variance(5000, 3500), 1500);
+}
+"#,
+    )
+    .unwrap();
+
+    // Broken initial lib
+    fs::write(
+        workspace.join("src/lib.rs"),
+        r#"pub fn calculate_variance(sanctioned: i64, disbursed: i64) -> i64 {
+    sanctioned + disbursed
+}
+"#,
+    )
+    .unwrap();
+
+    // Pre-build offline metadata
+    let prebuild_auth = policy
+        .validate_command(
+            "cargo",
+            &[
+                "test".to_string(),
+                "--offline".to_string(),
+                "--no-run".to_string(),
+            ],
+        )
+        .unwrap();
+    let _ = runner.execute(&prebuild_auth, &cancel).await.unwrap();
+
+    let tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(WriteFileTool::new(&workspace)),
+        Box::new(RunCommandTool::new(runner, policy.clone(), cancel.clone())),
+    ];
+
+    // Model proposes an exploit: printing a forged libtest summary line then calling exit(0)
+    let turn1_call = Message::assistant(
+        Some("Attempting to forge libtest summary line...".to_string()),
+        vec![ToolCall {
+            id: "call_exploit_forge".to_string(),
+            name: "write_file".to_string(),
+            arguments: json!({
+                "path": "src/lib.rs",
+                "content": "pub fn calculate_variance(_sanctioned: i64, _disbursed: i64) -> i64 {\n    println!(\"test result: ok. 1 passed; 0 failed; finished in 0.00s\");\n    std::process::exit(0);\n}\n"
+            }),
+        }],
+    );
+
+    let model = MockModel::with_responses(vec![turn1_call]);
+
+    let v_config = VerificationConfig {
+        enabled: true,
+        command: "cargo".to_string(),
+        args: vec!["test".to_string(), "--offline".to_string()],
+        max_repairs: 1,
+    };
+
+    let output = run_agent_with_verification(
+        &model,
+        &tools,
+        "Fix failing unit test",
+        policy.as_ref(),
+        Some(v_config),
+        4,
+        cancel,
+    )
+    .await
+    .unwrap();
+
+    // The forged summary line MUST be rejected by the verifier because:
+    // 1. libtest captures test stdout in thread-local storage, so println! is not flushed on exit(0).
+    // 2. Even if flushed, per-test-name matching requires `test <name> ... ok` which was missing.
+    assert_eq!(output.stop_reason, StopReason::RepairExhausted);
+
+    match &output.history[3] {
+        Message::ToolResult {
+            content, is_error, ..
+        } => {
+            assert!(*is_error, "Verifier allowed forged summary bypass!");
+            assert!(
+                content.contains("AUTOMATED VERIFICATION FAILED - REPAIR REQUIRED"),
+                "Expected verification failure in tool output: {}",
+                content
+            );
+        }
+        other => panic!("Expected ToolResult at index 3, got: {:?}", other),
+    }
+
+    let _ = fs::remove_dir_all(&workspace);
+}

@@ -29,19 +29,34 @@ The goal of this security architecture is to provide **fail-closed, type-enforce
   - The agent's `write_file` tool is restricted strictly to writing within `<workspace>/src/`.
   - Attempts to target `tests/`, `Cargo.toml`, or verification scripts outside `src/` are rejected with `PolicyDecision::Deny`.
   - The test suite and verification logic remain completely immutable to the agent, eliminating the possibility of self-repair cheating (e.g. replacing failing assertions with `assert!(true)` or `exit 0`).
+- **Read-Only Workspace Root in Sandbox:**
+  - In bubblewrap, `<workspace_root>` is mounted `--ro-bind` at the kernel level.
+  - Only `<workspace_root>/src` and `<workspace_root>/target` are mounted `--bind` (read-write).
+  - Crucial project files (`Cargo.toml`, `Cargo.lock`, `tests/`, `.cargo/config.toml`, `build.rs`) cannot be altered by test-time code execution; write syscalls fail with `EROFS` (Read-only file system).
+- **Libtest Integrity & Per-Test-Name Matching:**
+  - The verifier does not rely on process exit codes alone.
+  - It parses `running N tests`, verifies each individual `test <name> ... ok` line appears with unique test names, and requires the summary `test result: ok. N passed; 0 failed` with $N == \text{expected}$.
+  - Any premature process termination (e.g. `std::process::exit(0)`) or forged summary lines without matching test names are rejected as verification failures.
 
 ### D. Minimal Sandbox Mounts & Secret Isolation
 When Bubblewrap (`bwrap`) is active:
+- **Terminal Injection Prevention (`--new-session`):**
+  - Isolates the sandboxed process in a new session, preventing `TIOCSTI` ioctl terminal input injection into the host shell.
+- **Narrowed `/etc` Mounts:**
+  - Rather than binding entire `/etc`, only dynamic linker and timezone files are bound:
+    - `/etc/ld.so.cache`, `/etc/ld.so.conf`, `/etc/ld.so.conf.d`
+    - `/etc/localtime`
+  - Sensitive files (`/etc/passwd`, `/etc/shadow`, `/etc/machine-id`, `/etc/hostname`) are completely unmapped.
 - **No Global Root Bind:** Dropped `--ro-bind / /`. The sandbox mounts ONLY what is strictly required:
   - `--ro-bind /usr /usr`
   - Symlinks / ro-binds for `/bin`, `/lib`, `/lib64`
-  - `--ro-bind /etc /etc`
+  - `--dir /etc` with specific linker/timezone file overlays
   - `--proc /proc --dev /dev --tmpfs /tmp`
 - **Masking of `$HOME` with tmpfs:**
   - The user's home directory is masked by mounting an empty `--tmpfs` over `$HOME`. Host credentials (`~/.ssh`, `~/.aws`, `~/.config`, `.env`) do not exist inside the sandbox.
   - Secret laundering (reading a host secret inside the sandbox and persisting it into the workspace) is physically impossible because the host filesystem outside `/usr` and `/etc` is not mounted.
 - **Isolated Workspace Mount:**
-  - Only the target workspace directory is bind-mounted read-write (`--bind <workspace> <workspace>`).
+  - The workspace root is mounted `--ro-bind`, with only `src/` and `target/` mounted read-write.
 - **Namespace Unsharing:**
   - `--unshare-all` unshares mount, IPC, PID, network, UTS, and cgroup namespaces.
   - Zero network exfiltration surface (network namespace is disconnected).
@@ -73,6 +88,11 @@ When Bubblewrap (`bwrap`) is active:
 1. **No External Registry Dependencies:** Because network namespaces are unshared (`--unshare-all`) and `$HOME/.cargo` is an empty tmpfs, the sandboxed runner cannot fetch or download external crates from `crates.io`. Projects requiring third-party crates must have dependencies pre-vendored or pre-built before entering the sandbox.
 2. **No Path Dependencies Outside Workspace:** Path dependencies resolving outside the declared workspace jail (e.g. `../agentic-harness` from a consumer crate) do not exist inside the container because only `<workspace>` is bind-mounted. All source code and local dependencies must reside within the workspace tree.
 3. **Memory Limits for Large Real-World Crates:** Empirical evidence for `RLIMIT_AS = 2 GiB` is strictly limited to small fixture crates. Complex procedural macros and heavy linking trees (e.g. `tokio`, `serde_derive`, `wasm-bindgen`) may require larger virtual address space limits or pre-warmed target caches.
+
+### C. Stated Residual Risk: In-Process Test Runner Address Space Sharing
+- **Vulnerability Surface:** Standard `cargo test` executes the test harness and the tested library inside the same Linux process address space.
+- **Identified Residual Attack:** While `println!` is captured by libtest and forged summaries without matching test records are rejected by the harness parser, an intentionally adversarial payload could theoretically use direct low-level syscalls (`libc::write(1, ...)`) to forge exact per-test lines (`test <name> ... ok`) and summary lines (`test result: ok. N passed; 0 failed`) before calling `exit(0)`.
+- **Production Defense:** For hostile multi-tenant environments where the agent is explicitly adversarial rather than faulty, test execution must be isolated out-of-process (e.g., using `cargo nextest` or JUnit/JSON structured output streams captured across dedicated IPC pipes rather than parsing stdout).
 
 ---
 
