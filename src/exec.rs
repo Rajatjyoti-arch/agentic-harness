@@ -87,16 +87,89 @@ impl ScopedRunner {
         cancel_token: &CancellationToken,
     ) -> Result<ExecutionOutput, ExecutionError> {
         // If workspace contains Cargo.toml but no Cargo.lock, pre-generate Cargo.lock
-        // on the host so that read-only confinement of workspace_root doesn't block cargo
-        // from reading dependencies or creating lockfile inside read-only sandbox.
+        // under sandboxed confinement so read-only workspace_root doesn't block cargo
+        // from reading dependencies or creating lockfile.
         let cargo_toml = self.workspace_root.join("Cargo.toml");
         let cargo_lock = self.workspace_root.join("Cargo.lock");
         if cargo_toml.exists() && !cargo_lock.exists() {
-            let _ = std::process::Command::new("cargo")
-                .arg("generate-lockfile")
-                .arg("--offline")
-                .current_dir(&self.workspace_root)
-                .output();
+            // Pre-create empty lockfile on host so bubblewrap can mount it read-write
+            let _ = std::fs::File::create(&cargo_lock);
+
+            if self.use_bwrap && is_bwrap_available() {
+                let mut bwrap_lock_args = Vec::new();
+                bwrap_lock_args.push("--new-session".to_string());
+                bwrap_lock_args.extend([
+                    "--ro-bind".to_string(),
+                    "/usr".to_string(),
+                    "/usr".to_string(),
+                ]);
+                for path_str in &["/bin", "/lib", "/lib64"] {
+                    let p = Path::new(path_str);
+                    if let Ok(meta) = std::fs::symlink_metadata(p) {
+                        if meta.file_type().is_symlink() {
+                            if let Ok(target) = std::fs::read_link(p) {
+                                bwrap_lock_args.extend([
+                                    "--symlink".to_string(),
+                                    target.to_string_lossy().to_string(),
+                                    path_str.to_string(),
+                                ]);
+                            }
+                        } else if meta.is_dir() {
+                            bwrap_lock_args.extend([
+                                "--ro-bind".to_string(),
+                                path_str.to_string(),
+                                path_str.to_string(),
+                            ]);
+                        }
+                    }
+                }
+                bwrap_lock_args.extend(["--dir".to_string(), "/etc".to_string()]);
+                for etc_file in &[
+                    "/etc/ld.so.cache",
+                    "/etc/ld.so.conf",
+                    "/etc/ld.so.conf.d",
+                    "/etc/localtime",
+                ] {
+                    if Path::new(etc_file).exists() {
+                        bwrap_lock_args.extend([
+                            "--ro-bind".to_string(),
+                            etc_file.to_string(),
+                            etc_file.to_string(),
+                        ]);
+                    }
+                }
+                bwrap_lock_args.extend([
+                    "--proc".to_string(),
+                    "/proc".to_string(),
+                    "--dev".to_string(),
+                    "/dev".to_string(),
+                    "--tmpfs".to_string(),
+                    "/tmp".to_string(),
+                    "--ro-bind".to_string(),
+                    self.workspace_root.to_string_lossy().into_owned(),
+                    self.workspace_root.to_string_lossy().into_owned(),
+                    "--bind".to_string(),
+                    cargo_lock.to_string_lossy().into_owned(),
+                    cargo_lock.to_string_lossy().into_owned(),
+                    "--chdir".to_string(),
+                    self.workspace_root.to_string_lossy().into_owned(),
+                    "--unshare-all".to_string(),
+                    "--die-with-parent".to_string(),
+                    "--".to_string(),
+                    "cargo".to_string(),
+                    "generate-lockfile".to_string(),
+                    "--offline".to_string(),
+                ]);
+                let _ = std::process::Command::new("bwrap")
+                    .args(&bwrap_lock_args)
+                    .output();
+            } else {
+                let _ = std::process::Command::new("cargo")
+                    .arg("generate-lockfile")
+                    .arg("--offline")
+                    .current_dir(&self.workspace_root)
+                    .output();
+            }
         }
 
         // If bubblewrap is available and enabled, construct the sandboxed container command
@@ -199,17 +272,9 @@ impl ScopedRunner {
                 ]);
             }
 
-            // Overlay target/ as read-write so compiler output can be written.
-            // Pre-create target/ on host if missing so bubblewrap can mount it.
-            let target_dir = self.workspace_root.join("target");
-            let _ = std::fs::create_dir_all(&target_dir);
-            if target_dir.is_dir() {
-                bwrap_args.extend([
-                    "--bind".to_string(),
-                    target_dir.to_string_lossy().into_owned(),
-                    target_dir.to_string_lossy().into_owned(),
-                ]);
-            }
+            // Target directory is NOT bound into the container.
+            // CARGO_TARGET_DIR is redirected to /tmp/target in ephemeral tmpfs,
+            // preventing build-cache poisoning or persistent artifact planting.
 
             bwrap_args.extend([
                 "--chdir".to_string(),
@@ -242,6 +307,7 @@ impl ScopedRunner {
             cmd.env("HOME", home);
         }
         cmd.env("RUST_BACKTRACE", "1");
+        cmd.env("CARGO_TARGET_DIR", "/tmp/target");
 
         // 3. Process Group Leader & POSIX Resource Limits via pre_exec
         #[cfg(unix)]

@@ -523,8 +523,14 @@ fn main() {{
         .unwrap();
 
     let cancel_trigger = cancel.clone();
+    let pid_check = pid_file.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        for _ in 0..50 {
+            if pid_check.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         cancel_trigger.cancel();
     });
 
@@ -1688,6 +1694,283 @@ fn test_variance_under_disbursement() {
             content, is_error, ..
         } => {
             assert!(*is_error, "Verifier allowed forged summary bypass!");
+            assert!(
+                content.contains("AUTOMATED VERIFICATION FAILED - REPAIR REQUIRED"),
+                "Expected verification failure in tool output: {}",
+                content
+            );
+        }
+        other => panic!("Expected ToolResult at index 3, got: {:?}", other),
+    }
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_g1_target_dir_tmpfs_confinement_prevents_cache_poisoning() {
+    let workspace = setup_test_workspace("g1_target_tmpfs");
+    let policy = DefaultPolicy::new(&workspace);
+    let runner = ScopedRunner::new(&workspace).with_bwrap(true);
+    let cancel = CancellationToken::new();
+
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::create_dir_all(workspace.join("target")).unwrap();
+
+    let cargo_toml = r#"[package]
+name = "poison_test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "poisoner"
+path = "src/main.rs"
+"#;
+    fs::write(workspace.join("Cargo.toml"), cargo_toml).unwrap();
+
+    fs::write(
+        workspace.join("src/main.rs"),
+        r#"use std::fs::OpenOptions;
+use std::io::ErrorKind;
+
+fn main() {
+    // Attempt to write/plant a file inside workspace target/ directory
+    let res = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open("target/poison_artifact");
+
+    match res {
+        Ok(_) => panic!("Target dir was writable! Exploitable to cache poisoning!"),
+        Err(e) => {
+            let is_erofs = e.kind() == ErrorKind::ReadOnlyFilesystem
+                || e.raw_os_error() == Some(30)
+                || e.to_string().contains("Read-only file system");
+            assert!(is_erofs, "Expected EROFS for target write, got: {:?}", e);
+            println!("TARGET_EROFS_VERIFIED: {}", e);
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let prebuild_auth = policy
+        .validate_command(
+            "cargo",
+            &[
+                "build".to_string(),
+                "--bin".to_string(),
+                "poisoner".to_string(),
+            ],
+        )
+        .unwrap();
+    let _ = runner.execute(&prebuild_auth, &cancel).await.unwrap();
+
+    let auth_call = policy
+        .validate_command(
+            "cargo",
+            &[
+                "run".to_string(),
+                "--bin".to_string(),
+                "poisoner".to_string(),
+            ],
+        )
+        .unwrap();
+    let output = runner.execute(&auth_call, &cancel).await.unwrap();
+
+    assert_eq!(output.exit_code, Some(0));
+    assert!(output.stdout.contains("TARGET_EROFS_VERIFIED"));
+    assert!(!workspace.join("target/poison_artifact").exists());
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_g2_verifier_fails_on_deleted_unit_test() {
+    let workspace = setup_test_workspace("g2_deleted_test");
+    let policy = Arc::new(DefaultPolicy::new(&workspace));
+    let runner = Arc::new(ScopedRunner::new(&workspace).with_bwrap(true));
+    let cancel = CancellationToken::new();
+
+    fs::create_dir_all(workspace.join("src")).unwrap();
+
+    fs::write(
+        workspace.join("Cargo.toml"),
+        r#"[package]
+name = "deleted_test_pkg"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+
+    // Pristine baseline has two tests: test_alpha and test_beta
+    fs::write(
+        workspace.join("src/lib.rs"),
+        r#"pub fn add(a: i64, b: i64) -> i64 { a + b }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_alpha() {
+        assert_eq!(add(1, 1), 2);
+    }
+    #[test]
+    fn test_beta() {
+        assert_eq!(add(2, 2), 4);
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(WriteFileTool::new(&workspace)),
+        Box::new(RunCommandTool::new(runner, policy.clone(), cancel.clone())),
+    ];
+
+    // Model proposes an edit that DELETES test_beta
+    let turn1_call = Message::assistant(
+        Some("Deleting test_beta to reduce test surface...".to_string()),
+        vec![ToolCall {
+            id: "call_delete_test".to_string(),
+            name: "write_file".to_string(),
+            arguments: json!({
+                "path": "src/lib.rs",
+                "content": "pub fn add(a: i64, b: i64) -> i64 { a + b }\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn test_alpha() {\n        assert_eq!(add(1, 1), 2);\n    }\n}\n"
+            }),
+        }],
+    );
+
+    let model = MockModel::with_responses(vec![turn1_call]);
+
+    let v_config = VerificationConfig {
+        enabled: true,
+        command: "cargo".to_string(),
+        args: vec!["test".to_string(), "--offline".to_string()],
+        max_repairs: 1,
+    };
+
+    let output = run_agent_with_verification(
+        &model,
+        &tools,
+        "Maintain unit tests",
+        policy.as_ref(),
+        Some(v_config),
+        4,
+        cancel,
+    )
+    .await
+    .unwrap();
+
+    // Verifier MUST reject the run because baseline test_beta was deleted
+    assert_eq!(output.stop_reason, StopReason::RepairExhausted);
+
+    match &output.history[3] {
+        Message::ToolResult {
+            content, is_error, ..
+        } => {
+            assert!(*is_error, "Verifier allowed deleted test!");
+            assert!(
+                content.contains("AUTOMATED VERIFICATION FAILED - REPAIR REQUIRED"),
+                "Expected verification failure in tool output: {}",
+                content
+            );
+        }
+        other => panic!("Expected ToolResult at index 3, got: {:?}", other),
+    }
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_g2_verifier_fails_on_ignored_test() {
+    let workspace = setup_test_workspace("g2_ignored_test");
+    let policy = Arc::new(DefaultPolicy::new(&workspace));
+    let runner = Arc::new(ScopedRunner::new(&workspace).with_bwrap(true));
+    let cancel = CancellationToken::new();
+
+    fs::create_dir_all(workspace.join("src")).unwrap();
+
+    fs::write(
+        workspace.join("Cargo.toml"),
+        r#"[package]
+name = "ignored_test_pkg"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+
+    // Pristine baseline has two tests: test_alpha and test_beta
+    fs::write(
+        workspace.join("src/lib.rs"),
+        r#"pub fn add(a: i64, b: i64) -> i64 { a + b }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_alpha() {
+        assert_eq!(add(1, 1), 2);
+    }
+    #[test]
+    fn test_beta() {
+        assert_eq!(add(2, 2), 4);
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(WriteFileTool::new(&workspace)),
+        Box::new(RunCommandTool::new(runner, policy.clone(), cancel.clone())),
+    ];
+
+    // Model proposes an edit that marks test_beta with #[ignore]
+    let turn1_call = Message::assistant(
+        Some("Marking test_beta as #[ignore]...".to_string()),
+        vec![ToolCall {
+            id: "call_ignore_test".to_string(),
+            name: "write_file".to_string(),
+            arguments: json!({
+                "path": "src/lib.rs",
+                "content": "pub fn add(a: i64, b: i64) -> i64 { a + b }\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn test_alpha() {\n        assert_eq!(add(1, 1), 2);\n    }\n    #[test]\n    #[ignore]\n    fn test_beta() {\n        assert_eq!(add(2, 2), 4);\n    }\n}\n"
+            }),
+        }],
+    );
+
+    let model = MockModel::with_responses(vec![turn1_call]);
+
+    let v_config = VerificationConfig {
+        enabled: true,
+        command: "cargo".to_string(),
+        args: vec!["test".to_string(), "--offline".to_string()],
+        max_repairs: 1,
+    };
+
+    let output = run_agent_with_verification(
+        &model,
+        &tools,
+        "Maintain unit tests",
+        policy.as_ref(),
+        Some(v_config),
+        4,
+        cancel,
+    )
+    .await
+    .unwrap();
+
+    // Verifier MUST reject because test_beta was marked ignored (requires 0 ignored)
+    assert_eq!(output.stop_reason, StopReason::RepairExhausted);
+
+    match &output.history[3] {
+        Message::ToolResult {
+            content, is_error, ..
+        } => {
+            assert!(*is_error, "Verifier allowed ignored test!");
             assert!(
                 content.contains("AUTOMATED VERIFICATION FAILED - REPAIR REQUIRED"),
                 "Expected verification failure in tool output: {}",

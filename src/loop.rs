@@ -95,6 +95,31 @@ pub async fn run_with_verification(
     let mut repair_attempts = 0usize;
     let mut format_retry_count = 0usize;
 
+    // Baseline Test Suite Collection (captured from pristine workspace before any model edits)
+    let mut baseline_test_names = std::collections::HashSet::new();
+    if let Some(v_config) = verification.as_ref().filter(|v| v.enabled)
+        && let Some(run_tool) = tools.iter().find(|t| t.name() == "run_command")
+    {
+        let baseline_call = ToolCall {
+            id: "baseline_verification".to_string(),
+            name: "run_command".to_string(),
+            arguments: json!({
+                "cmd": v_config.command,
+                "args": v_config.args
+            }),
+        };
+        if let PolicyDecision::AllowCommand(_) = policy.evaluate(&baseline_call, run_tool.as_ref())
+            && let Ok(base_out) = run_tool.run(baseline_call.arguments).await
+        {
+            baseline_test_names = extract_test_names(&base_out);
+            println!(
+                "[Agent Trace] Pristine baseline test suite captured ({} tests: {:?})",
+                baseline_test_names.len(),
+                baseline_test_names
+            );
+        }
+    }
+
     for turn in 1..=max_turns {
         if cancel_token.is_cancelled() {
             println!("[Agent Trace] Run cancelled by token.");
@@ -325,6 +350,7 @@ pub async fn run_with_verification(
                                                                     let v_dur = v_start.elapsed();
                                                                     if verify_libtest_summary(
                                                                         &v_out,
+                                                                        Some(&baseline_test_names),
                                                                     ) {
                                                                         println!(
                                                                             "[Agent Trace] Turn {}: Automated verification PASSED in {:?}",
@@ -467,104 +493,130 @@ pub async fn run_with_verification(
     })
 }
 
-/// Parses the libtest summary from verification output.
+/// Extracts all test names from test output lines matching `test <name> ... <status>`.
+pub fn extract_test_names(output: &str) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("test ")
+            && let Some(idx) = rest.find(" ... ")
+        {
+            let name = rest[..idx].trim();
+            if !name.is_empty() {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Parses the libtest summary across all test suites in verification output.
 ///
 /// Validates:
 /// 1. Command exit code is 0 (if reported in output).
 /// 2. For each test suite reported in stdout:
-///    - `running N tests` declares N expected tests.
-///    - Exactly N individual tests match `test <name> ... ok` with distinct names.
-///    - The suite summary `test result: ok. N passed; 0 failed` confirms N passed and 0 failed.
-/// 3. At least one suite with N > 0 completed successfully.
-/// 4. No suite failed or was truncated prematurely without its summary line.
-///
-/// A process that exits 0 without completing libtest (e.g., via `std::process::exit(0)`)
-/// or prints forged summary lines without matching per-test execution records
-/// is strictly rejected as FAILED.
-pub fn verify_libtest_summary(output: &str) -> bool {
+///    - Sums passed, failed, ignored, and filtered out counts across all `test result:` lines.
+///    - Requires exactly 0 failed, 0 ignored, and 0 filtered out.
+///    - Validates that each individual test `test <name> ... ok` appears exactly once with unique names.
+/// 3. If a pristine baseline test suite was captured:
+///    - Every baseline test name must be present in the passed test names set exactly once.
+///    - Total passed must equal the baseline test count.
+///    - Any deleted test or #[ignore] test causes verification to FAIL.
+pub fn verify_libtest_summary(
+    output: &str,
+    baseline: Option<&std::collections::HashSet<String>>,
+) -> bool {
     // If output contains an exit code marker, ensure it is 0
     if output.contains("Exit Code:") && !output.contains("Exit Code: 0") {
         return false;
     }
 
-    let mut current_suite_expected: Option<usize> = None;
-    let mut current_suite_names = std::collections::HashSet::new();
+    let mut passed_names = std::collections::HashSet::new();
     let mut total_passed = 0usize;
-    let mut completed_suites = 0usize;
+    let mut total_failed = 0usize;
+    let mut total_ignored = 0usize;
+    let mut total_filtered_out = 0usize;
+    let mut summary_lines_count = 0usize;
 
     for line in output.lines() {
         let trimmed = line.trim();
 
-        // Detect "running N tests" or "running 1 test"
-        if let Some(rest) = trimmed.strip_prefix("running ")
-            && let Some(idx) = rest.find(" test")
-            && let Ok(count) = rest[..idx].trim().parse::<usize>()
-        {
-            // If a previous suite started with count > 0 but didn't finish,
-            // that means it was aborted (e.g. exit(0)) before printing summary!
-            if let Some(prev) = current_suite_expected
-                && prev > 0
-            {
-                return false;
-            }
-            current_suite_expected = Some(count);
-            current_suite_names.clear();
-        }
-
-        // Per-test-name matching: "test <name> ... ok"
+        // Track passed test names: "test <name> ... ok"
         if let Some(rest) = trimmed.strip_prefix("test ")
             && let Some(name) = rest.strip_suffix(" ... ok")
         {
             let test_name = name.trim();
-            if !test_name.is_empty() && !current_suite_names.insert(test_name.to_string()) {
-                return false; // Duplicate test name report
+            if !test_name.is_empty() && !passed_names.insert(test_name.to_string()) {
+                return false; // Duplicate test name execution record
             }
         }
 
-        // Detect summary line: "test result: ok. N passed; 0 failed; ..."
-        if let Some(rest) = trimmed.strip_prefix("test result: ") {
-            if let Some(summary) = rest.strip_prefix("ok. ") {
-                let parts: Vec<&str> = summary.split(';').collect();
-                if parts.len() >= 2 {
-                    let passed_part = parts[0].trim();
-                    let failed_part = parts[1].trim();
-                    let passed_count = passed_part
-                        .split_whitespace()
-                        .next()
-                        .and_then(|n| n.parse::<usize>().ok());
-                    let failed_count = failed_part
-                        .split_whitespace()
-                        .next()
-                        .and_then(|n| n.parse::<usize>().ok());
+        // Sum across ALL "test result:" summary lines
+        if let Some(rest) = trimmed.strip_prefix("test result:") {
+            summary_lines_count += 1;
+            let parts: Vec<&str> = rest.split(';').collect();
+            if parts.len() >= 5 {
+                let passed = parts[0]
+                    .split_whitespace()
+                    .filter_map(|w| w.parse::<usize>().ok())
+                    .next_back()
+                    .unwrap_or(0);
+                let failed = parts[1]
+                    .split_whitespace()
+                    .filter_map(|w| w.parse::<usize>().ok())
+                    .next_back()
+                    .unwrap_or(0);
+                let ignored = parts[2]
+                    .split_whitespace()
+                    .filter_map(|w| w.parse::<usize>().ok())
+                    .next_back()
+                    .unwrap_or(0);
+                let filtered = parts[4]
+                    .split_whitespace()
+                    .filter_map(|w| w.parse::<usize>().ok())
+                    .next_back()
+                    .unwrap_or(0);
 
-                    if let (Some(passed), Some(0)) = (passed_count, failed_count) {
-                        if let Some(expected) = current_suite_expected
-                            && (passed != expected || current_suite_names.len() != expected)
-                        {
-                            return false;
-                        }
-                        total_passed += passed;
-                        completed_suites += 1;
-                        current_suite_expected = None;
-                        current_suite_names.clear();
-                    } else {
-                        return false;
-                    }
-                }
+                total_passed += passed;
+                total_failed += failed;
+                total_ignored += ignored;
+                total_filtered_out += filtered;
             } else {
-                // If it starts with "test result: FAILED" or anything not "ok."
                 return false;
             }
         }
     }
 
-    // If a suite started with expected > 0 but was cut short without summary line:
-    if let Some(expected) = current_suite_expected
-        && expected > 0
+    // Strict verifier requirements:
+    // 1. At least one summary line parsed and at least 1 test passed
+    // 2. Exactly 0 failed
+    // 3. Exactly 0 ignored
+    // 4. Exactly 0 filtered out
+    // 5. Total passed count equals unique test names recorded
+    if summary_lines_count == 0
+        || total_passed == 0
+        || total_failed != 0
+        || total_ignored != 0
+        || total_filtered_out != 0
+        || passed_names.len() != total_passed
     {
         return false;
     }
 
-    // Require at least one suite to have completed and at least 1 test passed
-    completed_suites > 0 && total_passed > 0
+    // 6. If baseline test suite was captured, require EVERY baseline test name present exactly once
+    if let Some(expected_baseline) = baseline
+        && !expected_baseline.is_empty()
+    {
+        if total_passed != expected_baseline.len() || passed_names.len() != expected_baseline.len()
+        {
+            return false;
+        }
+        for base_name in expected_baseline {
+            if !passed_names.contains(base_name) {
+                return false;
+            }
+        }
+    }
+
+    true
 }
