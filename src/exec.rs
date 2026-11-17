@@ -1,3 +1,4 @@
+use crate::policy::is_bwrap_available;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
@@ -28,11 +29,12 @@ pub struct ExecutionOutput {
 }
 
 /// Bounded subprocess runner enforcing Linux resource limits, environment sanitization,
-/// output caps, and clean process-group termination without orphaned child trees.
+/// output caps, optional containerized bubblewrap confinement, and process-group termination.
 pub struct ScopedRunner {
     workspace_root: PathBuf,
     default_timeout: Duration,
     max_output_bytes: usize,
+    use_bwrap: bool,
 }
 
 impl ScopedRunner {
@@ -42,6 +44,7 @@ impl ScopedRunner {
             workspace_root: workspace_root.as_ref().to_path_buf(),
             default_timeout: Duration::from_secs(30),
             max_output_bytes: 512 * 1024, // 512 KB
+            use_bwrap: is_bwrap_available(),
         }
     }
 
@@ -57,15 +60,61 @@ impl ScopedRunner {
         self
     }
 
+    /// Configures whether bubblewrap isolation is enabled.
+    pub fn with_bwrap(mut self, enabled: bool) -> Self {
+        self.use_bwrap = enabled;
+        self
+    }
+
     /// Executes a command within the sandboxed environment with cooperative cancellation.
+    ///
+    /// Never invokes a shell parser: invokes `Command::new(program).args(args)` directly.
     pub async fn run(
         &self,
         program: &str,
         args: &[String],
         cancel_token: &CancellationToken,
     ) -> Result<ExecutionOutput, ExecutionError> {
-        let mut cmd = Command::new(program);
-        cmd.args(args);
+        // If bubblewrap is available and enabled, construct the sandboxed container command
+        let (exec_program, exec_args) = if self.use_bwrap && is_bwrap_available() {
+            let mut bwrap_args = vec![
+                "--ro-bind".to_string(),
+                "/".to_string(),
+                "/".to_string(),
+                "--tmpfs".to_string(),
+                "/tmp".to_string(),
+                "--proc".to_string(),
+                "/proc".to_string(),
+                "--dev".to_string(),
+                "/dev".to_string(),
+                "--bind".to_string(),
+                self.workspace_root.to_string_lossy().into_owned(),
+                self.workspace_root.to_string_lossy().into_owned(),
+                "--unshare-all".to_string(),
+                "--die-with-parent".to_string(),
+                "--chdir".to_string(),
+                self.workspace_root.to_string_lossy().into_owned(),
+            ];
+
+            // Mask sensitive host directories like ~/.ssh with empty tmpfs mounts
+            if let Ok(home) = std::env::var("HOME") {
+                let ssh_dir = Path::new(&home).join(".ssh");
+                if ssh_dir.exists() {
+                    bwrap_args.push("--tmpfs".to_string());
+                    bwrap_args.push(ssh_dir.to_string_lossy().into_owned());
+                }
+            }
+
+            bwrap_args.push("--".to_string());
+            bwrap_args.push(program.to_string());
+            bwrap_args.extend_from_slice(args);
+            ("bwrap".to_string(), bwrap_args)
+        } else {
+            (program.to_string(), args.to_vec())
+        };
+
+        let mut cmd = Command::new(&exec_program);
+        cmd.args(&exec_args);
 
         // 1. Working directory locked to workspace root
         cmd.current_dir(&self.workspace_root);
@@ -93,33 +142,29 @@ impl ScopedRunner {
                     return Err(std::io::Error::last_os_error());
                 }
 
-                // Set resource limits:
-                // RLIMIT_AS (Virtual Address Space): 8 GB
+                // RLIMIT_AS (Virtual Address Space): strict 2 GiB
                 let as_limit = libc::rlimit {
-                    rlim_cur: 8 * 1024 * 1024 * 1024,
-                    rlim_max: 8 * 1024 * 1024 * 1024,
+                    rlim_cur: 2 * 1024 * 1024 * 1024,
+                    rlim_max: 2 * 1024 * 1024 * 1024,
                 };
                 libc::setrlimit(libc::RLIMIT_AS, &as_limit);
 
-                // RLIMIT_CPU (CPU Time seconds): 60s
+                // RLIMIT_CPU: soft = 60s, hard = 61s (kernel fires SIGKILL on hard limit)
                 let cpu_limit = libc::rlimit {
                     rlim_cur: 60,
-                    rlim_max: 60,
+                    rlim_max: 61,
                 };
                 libc::setrlimit(libc::RLIMIT_CPU, &cpu_limit);
 
-                // RLIMIT_NPROC (Maximum simultaneous child processes): Ensure not below current UID thread count
-                let mut current_nproc = libc::rlimit {
+                // RLIMIT_NPROC: Never raise inherited limit. In Linux, RLIMIT_NPROC is
+                // an aggregate count per real UID across all user sessions and desktop apps.
+                // We read inherited limit and never increase it.
+                let mut inherited_nproc = libc::rlimit {
                     rlim_cur: 0,
                     rlim_max: 0,
                 };
-                if libc::getrlimit(libc::RLIMIT_NPROC, &mut current_nproc) == 0 {
-                    let bounded = current_nproc.rlim_cur.clamp(2048, 8192);
-                    let nproc_limit = libc::rlimit {
-                        rlim_cur: bounded,
-                        rlim_max: current_nproc.rlim_max,
-                    };
-                    libc::setrlimit(libc::RLIMIT_NPROC, &nproc_limit);
+                if libc::getrlimit(libc::RLIMIT_NPROC, &mut inherited_nproc) == 0 {
+                    libc::setrlimit(libc::RLIMIT_NPROC, &inherited_nproc);
                 }
 
                 // RLIMIT_FSIZE (Maximum generated file size): 64 MB
@@ -156,7 +201,6 @@ impl ScopedRunner {
         // Asynchronously read bounded streams
         let stdout_handle = tokio::spawn(async move {
             let mut buf = Vec::new();
-            // Read up to max_bytes + 1 to detect truncation
             let _ = stdout_pipe
                 .take((max_bytes + 1) as u64)
                 .read_to_end(&mut buf)

@@ -1,7 +1,8 @@
 use crate::model::{Model, ModelError};
 use crate::policy::{Policy, PolicyDecision};
 use crate::tool::Tool;
-use crate::types::{Message, StopReason, ToolDefinition};
+use crate::types::{Message, StopReason, ToolCall, ToolDefinition};
+use serde_json::json;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -10,6 +11,26 @@ use tokio_util::sync::CancellationToken;
 pub enum AgentError {
     #[error("Model failure: {0}")]
     Model(#[from] ModelError),
+}
+
+/// Configuration for automated verification checks executed after mutating tool actions.
+#[derive(Debug, Clone)]
+pub struct VerificationConfig {
+    pub enabled: bool,
+    pub command: String,
+    pub args: Vec<String>,
+    pub max_repairs: usize,
+}
+
+impl Default for VerificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            command: "cargo".to_string(),
+            args: vec!["test".to_string(), "--quiet".to_string()],
+            max_repairs: 3,
+        }
+    }
 }
 
 /// The result returned after agent execution finishes.
@@ -23,10 +44,7 @@ pub struct AgentOutput {
     pub turns_executed: usize,
 }
 
-/// Executes the agent loop until the assistant completes or turns are exhausted.
-///
-/// Features policy-gated execution, process cancellation, step-by-step audit logging,
-/// and guards against executing partial tool arguments on token-length truncations.
+/// Executes the agent loop with default settings.
 pub async fn run(
     model: &dyn Model,
     tools: &[Box<dyn Tool>],
@@ -35,10 +53,25 @@ pub async fn run(
     max_turns: usize,
     cancel_token: CancellationToken,
 ) -> Result<AgentOutput, AgentError> {
+    run_with_verification(model, tools, task, policy, None, max_turns, cancel_token).await
+}
+
+/// Executes the agent loop with policy-gated tool execution, length-truncation guards,
+/// cooperative cancellation, and post-mutation self-repair verification cycles.
+pub async fn run_with_verification(
+    model: &dyn Model,
+    tools: &[Box<dyn Tool>],
+    task: &str,
+    policy: &dyn Policy,
+    verification: Option<VerificationConfig>,
+    max_turns: usize,
+    cancel_token: CancellationToken,
+) -> Result<AgentOutput, AgentError> {
     let mut history = vec![
         Message::system(
             "You are an autonomous engineering assistant operating within a sandboxed runtime. \
-            Execute tool calls cleanly, inspect outputs, and respect security policy bounds.",
+            Execute tool calls cleanly, inspect outputs, and respect security policy bounds. \
+            If verification fails, inspect the diagnostics and issue a repair.",
         ),
         Message::user(task),
     ];
@@ -53,6 +86,8 @@ pub async fn run(
         "[Agent Trace] Registered tools: {:?}",
         tool_definitions.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
+
+    let mut repair_attempts = 0usize;
 
     for turn in 1..=max_turns {
         if cancel_token.is_cancelled() {
@@ -150,7 +185,7 @@ pub async fn run(
                                     println!("[Agent Trace] Turn {}: POLICY DECISION: ALLOW", turn);
                                     let start = Instant::now();
                                     match tool.run(tool_call.arguments.clone()).await {
-                                        Ok(out) => {
+                                        Ok(mut out) => {
                                             let duration = start.elapsed();
                                             println!(
                                                 "[Agent Trace] Turn {}: Tool '{}' executed successfully in {:?} ({} bytes output)",
@@ -159,11 +194,115 @@ pub async fn run(
                                                 duration,
                                                 out.len()
                                             );
+
+                                            // Self-repair verification trigger after mutating actions
+                                            let mut verification_failed = false;
+                                            if let Some(v_config) =
+                                                verification.as_ref().filter(|v| {
+                                                    v.enabled && tool.name() == "write_file"
+                                                })
+                                            {
+                                                println!(
+                                                    "[Agent Trace] Turn {}: Mutating action detected. Triggering automated verification: '{} {:?}'",
+                                                    turn, v_config.command, v_config.args
+                                                );
+
+                                                let verify_call = ToolCall {
+                                                    id: format!("verify_call_{turn}"),
+                                                    name: "run_command".to_string(),
+                                                    arguments: json!({
+                                                        "cmd": v_config.command,
+                                                        "args": v_config.args
+                                                    }),
+                                                };
+
+                                                if let Some(run_tool) =
+                                                    tools.iter().find(|t| t.name() == "run_command")
+                                                {
+                                                    let v_decision = policy
+                                                        .evaluate(&verify_call, run_tool.as_ref());
+                                                    println!(
+                                                        "[Agent Trace] Turn {}: Verification command POLICY DECISION: {:?}",
+                                                        turn, v_decision
+                                                    );
+
+                                                    if v_decision == PolicyDecision::Allow {
+                                                        let v_start = Instant::now();
+                                                        match run_tool
+                                                            .run(verify_call.arguments)
+                                                            .await
+                                                        {
+                                                            Ok(v_out) => {
+                                                                let v_dur = v_start.elapsed();
+                                                                if v_out.contains("Exit Code: 0") {
+                                                                    println!(
+                                                                        "[Agent Trace] Turn {}: Automated verification PASSED in {:?}",
+                                                                        turn, v_dur
+                                                                    );
+                                                                    out.push_str(&format!("\n\n[AUTOMATED VERIFICATION PASSED in {:?}]\n{}", v_dur, v_out));
+                                                                } else {
+                                                                    repair_attempts += 1;
+                                                                    println!(
+                                                                        "[Agent Trace] Turn {}: Automated verification FAILED (Attempt {}/{}) in {:?}: Exit code non-zero",
+                                                                        turn,
+                                                                        repair_attempts,
+                                                                        v_config.max_repairs,
+                                                                        v_dur
+                                                                    );
+                                                                    out.push_str(&format!(
+                                                                                "\n\n[AUTOMATED VERIFICATION FAILED - REPAIR REQUIRED (Attempt {}/{})]\n{}",
+                                                                                repair_attempts, v_config.max_repairs, v_out
+                                                                            ));
+                                                                    verification_failed = true;
+                                                                }
+                                                            }
+                                                            Err(v_err) => {
+                                                                repair_attempts += 1;
+                                                                println!(
+                                                                    "[Agent Trace] Turn {}: Verification execution error (Attempt {}/{}): {}",
+                                                                    turn,
+                                                                    repair_attempts,
+                                                                    v_config.max_repairs,
+                                                                    v_err
+                                                                );
+                                                                out.push_str(&format!(
+                                                                            "\n\n[AUTOMATED VERIFICATION FAILED - EXECUTION ERROR (Attempt {}/{})]\n{}",
+                                                                            repair_attempts, v_config.max_repairs, v_err
+                                                                        ));
+                                                                verification_failed = true;
+                                                            }
+                                                        }
+                                                    } else {
+                                                        println!(
+                                                            "[Agent Trace] Turn {}: Verification command blocked by policy",
+                                                            turn
+                                                        );
+                                                    }
+                                                }
+                                            }
+
                                             history.push(Message::tool_result(
                                                 &tool_call.id,
                                                 out,
-                                                false,
+                                                verification_failed,
                                             ));
+
+                                            if let Some(v_config) =
+                                                verification.as_ref().filter(|v| {
+                                                    verification_failed
+                                                        && repair_attempts >= v.max_repairs
+                                                })
+                                            {
+                                                println!(
+                                                    "[Agent Trace] Turn {}: Maximum verification repair attempts ({}) exhausted. Terminating.",
+                                                    turn, v_config.max_repairs
+                                                );
+                                                return Ok(AgentOutput {
+                                                    history,
+                                                    stop_reason: StopReason::RepairExhausted,
+                                                    turns_executed: turn,
+                                                });
+                                            }
                                         }
                                         Err(err) => {
                                             println!(

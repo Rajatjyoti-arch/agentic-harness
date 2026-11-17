@@ -103,6 +103,8 @@ pub enum StopReason {
     ToolUse,
     /// Model generation truncated by maximum token limit (partial JSON risk).
     Length,
+    /// Verification check repeatedly failed and exhausted maximum self-repair attempts.
+    RepairExhausted,
     /// Loop reached configured maximum turn budget.
     MaxTurns,
     /// Loop stopped due to an unrecoverable model or execution error.

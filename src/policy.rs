@@ -19,12 +19,41 @@ pub trait Policy: Send + Sync {
     fn evaluate(&self, call: &ToolCall, tool: &dyn Tool) -> PolicyDecision;
 }
 
-/// Production default security policy enforcing workspace filesystem jailing
-/// and shell command guardrails.
+/// Permitted commands in the fail-closed allowlist v0.
+pub const ALLOWED_EXECUTABLES: &[&str] = &["cargo", "rustc", "git", "ls", "cat"];
+
+/// Disallowed interpreters and script runners that provide arbitrary command execution surfaces.
+pub const BLOCKED_INTERPRETERS: &[&str] = &[
+    "sh", "bash", "zsh", "csh", "tcsh", "dash", "ksh", "python", "python3", "python2", "node",
+    "perl", "ruby", "php", "env", "xargs", "find",
+];
+
+/// Allowed read-only subcommands for the `git` tool.
+pub const ALLOWED_GIT_SUBCOMMANDS: &[&str] =
+    &["status", "diff", "log", "rev-parse", "show", "branch"];
+
+/// Checks whether `bwrap` (bubblewrap sandbox utility) is present on system PATH.
+pub fn is_bwrap_available() -> bool {
+    if Path::new("/usr/bin/bwrap").exists() {
+        return true;
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in path_var.split(':') {
+            if Path::new(dir).join("bwrap").exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Production fail-closed security policy enforcing workspace filesystem jailing,
+/// strict command allowlists, and containerized bubblewrap confinement.
 #[derive(Debug, Clone)]
 pub struct DefaultPolicy {
     workspace_root: PathBuf,
     canonical_workspace_root: PathBuf,
+    enforce_bwrap: bool,
 }
 
 impl DefaultPolicy {
@@ -37,7 +66,14 @@ impl DefaultPolicy {
         Self {
             workspace_root: root,
             canonical_workspace_root: canonical,
+            enforce_bwrap: true,
         }
+    }
+
+    /// Configures whether bubblewrap isolation must be enforced for sensitive commands.
+    pub fn with_enforce_bwrap(mut self, enforce: bool) -> Self {
+        self.enforce_bwrap = enforce;
+        self
     }
 
     /// Verifies that a target path remains strictly inside the workspace jail,
@@ -134,42 +170,51 @@ impl DefaultPolicy {
         Ok(normalized)
     }
 
-    /// Evaluates command-line string and arguments against destructive deny-lists.
+    /// Evaluates executable and arguments against the fail-closed allowlist policy.
     pub fn validate_command(&self, cmd: &str, args: &[String]) -> Result<(), String> {
-        let full_command = format!("{} {}", cmd, args.join(" "));
-        let lower = full_command.to_lowercase();
+        let trimmed_cmd = cmd.trim();
+        if trimmed_cmd.is_empty() {
+            return Err("Command cannot be empty".to_string());
+        }
 
-        // 1. Destructive system-level commands
-        let forbidden_substrings = [
-            "rm -rf /",
-            "rm -rf /*",
-            "rm -rf ~",
-            ":(){ :|:& };:", // fork bomb
-            "mkfs",
-            "fdisk",
-            "dd if=",
-            "shutdown",
-            "reboot",
-            "poweroff",
-            "init 0",
-            "chmod -r 777 /",
-            "> /dev/sd",
-            "> /dev/nvme",
-        ];
+        // Extract base binary name (e.g., "/usr/bin/cargo" -> "cargo")
+        let base_name = Path::new(trimmed_cmd)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(trimmed_cmd);
 
-        for pattern in &forbidden_substrings {
-            if lower.contains(pattern) {
+        // 1. Interpreters are NEVER auto-allowed: deny arbitrary scripting surface
+        if BLOCKED_INTERPRETERS.contains(&base_name) {
+            return Err(format!(
+                "Execution of interpreter '{}' is blocked by policy: arbitrary scripting is prohibited",
+                base_name
+            ));
+        }
+
+        // 2. Strict executable allowlist check (Allowlist v0)
+        if !ALLOWED_EXECUTABLES.contains(&base_name) {
+            return Err(format!(
+                "Executable '{}' is not on the policy allowlist: only {:?} are permitted",
+                base_name, ALLOWED_EXECUTABLES
+            ));
+        }
+
+        // 3. For `git`, enforce read-only inspection subcommands only
+        if base_name == "git" {
+            let subcommand = args.first().map(|s| s.as_str()).unwrap_or("");
+            if !ALLOWED_GIT_SUBCOMMANDS.contains(&subcommand) {
                 return Err(format!(
-                    "Command denied: matches destructive pattern '{}'",
-                    pattern
+                    "Git subcommand '{}' is blocked by policy: only read-only subcommands {:?} are permitted",
+                    subcommand, ALLOWED_GIT_SUBCOMMANDS
                 ));
             }
         }
 
-        // 2. Reject commands attempting to read or mutate .git or .ssh
-        if lower.contains(".git/") || lower.contains(".ssh/") || lower.contains("/.ssh") {
+        // 4. Confinement enforcement: if cargo or interpreters are invoked without bwrap, fail closed
+        if self.enforce_bwrap && !is_bwrap_available() && base_name == "cargo" {
             return Err(
-                "Command denied: attempts access to protected repository/key directory".to_string(),
+                "Execution of 'cargo' denied: bubblewrap (bwrap) isolation runtime is not available on PATH"
+                    .to_string(),
             );
         }
 
@@ -190,6 +235,9 @@ impl Policy for DefaultPolicy {
                     } else {
                         PolicyDecision::Deny("Argument 'path' must be a valid string".to_string())
                     }
+                } else if call.name == "list_dir" {
+                    // list_dir defaults to "."
+                    PolicyDecision::Allow
                 } else {
                     PolicyDecision::Deny("Missing required argument 'path'".to_string())
                 }
@@ -217,10 +265,7 @@ impl Policy for DefaultPolicy {
                     Err(reason) => PolicyDecision::Deny(reason),
                 }
             }
-            _ => {
-                // Unknown tool names are allowed through to normal tool-lookup failure
-                PolicyDecision::Allow
-            }
+            _ => PolicyDecision::Allow,
         }
     }
 }

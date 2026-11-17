@@ -1,6 +1,7 @@
 use crate::exec::ScopedRunner;
 use crate::model::BoxFuture;
 use crate::types::ToolDefinition;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,6 +29,13 @@ pub trait Tool: Send + Sync {
 
     /// Executes the tool asynchronously with validated JSON arguments.
     fn run<'a>(&'a self, args: Value) -> BoxFuture<'a, Result<String, String>>;
+}
+
+/// Strongly typed arguments for `read_file`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadFileArgs {
+    pub path: String,
 }
 
 /// Reads text file contents within the workspace jail.
@@ -61,24 +69,31 @@ impl Tool for ReadFileTool {
                     "description": "Relative or absolute path within the workspace"
                 }
             },
-            "required": ["path"]
+            "required": ["path"],
+            "additionalProperties": false
         })
     }
 
     fn run<'a>(&'a self, args: Value) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async move {
-            let path_str = args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "Missing required parameter 'path'".to_string())?;
+            let parsed: ReadFileArgs = serde_json::from_value(args)
+                .map_err(|e| format!("Invalid arguments for read_file: {}", e))?;
 
-            let resolved = self.workspace_root.join(path_str);
+            let resolved = self.workspace_root.join(&parsed.path);
             match tokio::fs::read_to_string(&resolved).await {
                 Ok(content) => Ok(content),
-                Err(err) => Err(format!("Failed to read file '{}': {}", path_str, err)),
+                Err(err) => Err(format!("Failed to read file '{}': {}", parsed.path, err)),
             }
         })
     }
+}
+
+/// Strongly typed arguments for `write_file`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteFileArgs {
+    pub path: String,
+    pub content: String,
 }
 
 /// Atomically writes content to a file in the workspace jail and returns a unified diff.
@@ -116,23 +131,17 @@ impl Tool for WriteFileTool {
                     "description": "Full new UTF-8 content to write"
                 }
             },
-            "required": ["path", "content"]
+            "required": ["path", "content"],
+            "additionalProperties": false
         })
     }
 
     fn run<'a>(&'a self, args: Value) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async move {
-            let path_str = args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "Missing required parameter 'path'".to_string())?;
+            let parsed: WriteFileArgs = serde_json::from_value(args)
+                .map_err(|e| format!("Invalid arguments for write_file: {}", e))?;
 
-            let new_content = args
-                .get("content")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "Missing required parameter 'content'".to_string())?;
-
-            let target_path = self.workspace_root.join(path_str);
+            let target_path = self.workspace_root.join(&parsed.path);
 
             if let Some(parent) = target_path.parent()
                 && !parent.exists()
@@ -160,7 +169,7 @@ impl Tool for WriteFileTool {
             );
             let temp_path = parent_dir.join(temp_filename);
 
-            tokio::fs::write(&temp_path, new_content.as_bytes())
+            tokio::fs::write(&temp_path, parsed.content.as_bytes())
                 .await
                 .map_err(|e| format!("Failed to write temporary file: {}", e))?;
 
@@ -169,10 +178,22 @@ impl Tool for WriteFileTool {
                 .map_err(|e| format!("Failed to rename temporary file into place: {}", e))?;
 
             // Generate unified diff
-            let diff = generate_unified_diff(path_str, old_content.as_deref(), new_content);
+            let diff = generate_unified_diff(&parsed.path, old_content.as_deref(), &parsed.content);
             Ok(diff)
         })
     }
+}
+
+/// Strongly typed arguments for `list_dir`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListDirArgs {
+    #[serde(default = "default_dir_dot")]
+    pub path: String,
+}
+
+fn default_dir_dot() -> String {
+    ".".to_string()
 }
 
 /// Lists files and directories within a target directory in the workspace jail.
@@ -205,18 +226,20 @@ impl Tool for ListDirTool {
                     "type": "string",
                     "description": "Directory path to list (defaults to workspace root if empty)"
                 }
-            }
+            },
+            "additionalProperties": false
         })
     }
 
     fn run<'a>(&'a self, args: Value) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async move {
-            let path_str = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            let parsed: ListDirArgs = serde_json::from_value(args)
+                .map_err(|e| format!("Invalid arguments for list_dir: {}", e))?;
 
-            let target = self.workspace_root.join(path_str);
+            let target = self.workspace_root.join(&parsed.path);
             let mut read_dir = tokio::fs::read_dir(&target)
                 .await
-                .map_err(|e| format!("Failed to list directory '{}': {}", path_str, e))?;
+                .map_err(|e| format!("Failed to list directory '{}': {}", parsed.path, e))?;
 
             let mut entries = Vec::new();
             while let Ok(Some(entry)) = read_dir.next_entry().await {
@@ -235,7 +258,16 @@ impl Tool for ListDirTool {
     }
 }
 
-/// Executes a shell command using `ScopedRunner` within resource and jail limits.
+/// Strongly typed arguments for `run_command`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunCommandArgs {
+    pub cmd: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// Executes a shell command using `ScopedRunner` within resource, jail, and isolation limits.
 pub struct RunCommandTool {
     runner: Arc<ScopedRunner>,
     cancel_token: CancellationToken,
@@ -265,37 +297,29 @@ impl Tool for RunCommandTool {
             "properties": {
                 "cmd": {
                     "type": "string",
-                    "description": "Executable program or command to run (e.g., 'cargo', 'ls')"
+                    "description": "Executable program to run (e.g., 'cargo', 'git')"
                 },
                 "args": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Command-line arguments"
+                    "description": "Command-line arguments array passed directly to execve"
                 }
             },
-            "required": ["cmd"]
+            "required": ["cmd"],
+            "additionalProperties": false
         })
     }
 
     fn run<'a>(&'a self, args: Value) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async move {
-            let cmd = args
-                .get("cmd")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "Missing required parameter 'cmd'".to_string())?;
+            let parsed: RunCommandArgs = serde_json::from_value(args)
+                .map_err(|e| format!("Invalid arguments for run_command: {}", e))?;
 
-            let empty_vec = Vec::new();
-            let cmd_args: Vec<String> = args
-                .get("args")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(ToString::to_string))
-                        .collect()
-                })
-                .unwrap_or(empty_vec);
-
-            match self.runner.run(cmd, &cmd_args, &self.cancel_token).await {
+            match self
+                .runner
+                .run(&parsed.cmd, &parsed.args, &self.cancel_token)
+                .await
+            {
                 Ok(out) => {
                     let mut report = format!(
                         "Exit Code: {}\nDuration: {:?}\nTruncated: {}\n--- STDOUT ---\n{}\n--- STDERR ---\n{}",
@@ -345,7 +369,6 @@ fn generate_unified_diff(path: &str, old: Option<&str>, new: &str) -> String {
                 new_lines.len()
             ));
 
-            // Simple line diff
             let max = old_lines.len().max(new_lines.len());
             for i in 0..max {
                 match (old_lines.get(i), new_lines.get(i)) {
