@@ -88,6 +88,7 @@ pub async fn run_with_verification(
     );
 
     let mut repair_attempts = 0usize;
+    let mut format_retry_count = 0usize;
 
     for turn in 1..=max_turns {
         if cancel_token.is_cancelled() {
@@ -181,19 +182,90 @@ pub async fn run_with_verification(
                                         true,
                                     ));
                                 }
-                                PolicyDecision::Allow | PolicyDecision::AllowCommand(_) => {
-                                    if let PolicyDecision::AllowCommand(ref auth) = decision {
-                                        println!(
-                                            "[Agent Trace] Turn {}: POLICY DECISION: ALLOW COMMAND ({})",
-                                            turn,
-                                            auth.exe()
+                                PolicyDecision::AllowCommand(ref auth) => {
+                                    if tool_call.name != "run_command" {
+                                        let err_msg = format!(
+                                            "Security invariant violation: tool '{}' cannot be authorized with AllowCommand",
+                                            tool_call.name
                                         );
-                                    } else {
                                         println!(
-                                            "[Agent Trace] Turn {}: POLICY DECISION: ALLOW",
-                                            turn
+                                            "[Agent Trace] Turn {}: POLICY HARD REJECTION: {}",
+                                            turn, err_msg
                                         );
+                                        history.push(Message::tool_result(
+                                            &tool_call.id,
+                                            err_msg,
+                                            true,
+                                        ));
+                                        continue;
                                     }
+                                    println!(
+                                        "[Agent Trace] Turn {}: POLICY DECISION: ALLOW COMMAND ({})",
+                                        turn,
+                                        auth.exe()
+                                    );
+                                    let start = Instant::now();
+                                    match tool.run(tool_call.arguments.clone()).await {
+                                        Ok(out) => {
+                                            format_retry_count = 0;
+                                            let duration = start.elapsed();
+                                            println!(
+                                                "[Agent Trace] Turn {}: Tool '{}' executed successfully in {:?} ({} bytes output)",
+                                                turn,
+                                                tool_call.name,
+                                                duration,
+                                                out.len()
+                                            );
+                                            history.push(Message::tool_result(
+                                                &tool_call.id,
+                                                out,
+                                                false,
+                                            ));
+                                        }
+                                        Err(err) => {
+                                            println!(
+                                                "[Agent Trace] Turn {}: Tool '{}' failed: {}",
+                                                turn, tool_call.name, err
+                                            );
+                                            let is_format_err = err.contains("Invalid arguments")
+                                                || err.contains("missing field")
+                                                || err.contains("unknown field");
+                                            let feedback = if is_format_err
+                                                && format_retry_count < 1
+                                            {
+                                                format_retry_count += 1;
+                                                format!(
+                                                    "Argument Formatting Error: {}. Tool '{}' parameter schema: {}. Please retry with corrected JSON arguments (Formatting Retry 1/1).",
+                                                    err,
+                                                    tool.name(),
+                                                    tool.parameters_schema()
+                                                )
+                                            } else {
+                                                format!("Tool execution error: {}", err)
+                                            };
+                                            history.push(Message::tool_result(
+                                                &tool_call.id,
+                                                feedback,
+                                                true,
+                                            ));
+                                        }
+                                    }
+                                }
+                                PolicyDecision::Allow => {
+                                    if tool_call.name == "run_command" {
+                                        let err_msg = "Security invariant violation: 'run_command' cannot be authorized with PolicyDecision::Allow (requires AllowCommand with AuthorizedCall)".to_string();
+                                        println!(
+                                            "[Agent Trace] Turn {}: POLICY HARD REJECTION: {}",
+                                            turn, err_msg
+                                        );
+                                        history.push(Message::tool_result(
+                                            &tool_call.id,
+                                            err_msg,
+                                            true,
+                                        ));
+                                        continue;
+                                    }
+                                    println!("[Agent Trace] Turn {}: POLICY DECISION: ALLOW", turn);
                                     let start = Instant::now();
                                     match tool.run(tool_call.arguments.clone()).await {
                                         Ok(mut out) => {
@@ -335,9 +407,25 @@ pub async fn run_with_verification(
                                                 "[Agent Trace] Turn {}: Tool '{}' failed: {}",
                                                 turn, tool_call.name, err
                                             );
+                                            let is_format_err = err.contains("Invalid arguments")
+                                                || err.contains("missing field")
+                                                || err.contains("unknown field");
+                                            let feedback = if is_format_err
+                                                && format_retry_count < 1
+                                            {
+                                                format_retry_count += 1;
+                                                format!(
+                                                    "Argument Formatting Error: {}. Tool '{}' parameter schema: {}. Please retry with corrected JSON arguments (Formatting Retry 1/1).",
+                                                    err,
+                                                    tool.name(),
+                                                    tool.parameters_schema()
+                                                )
+                                            } else {
+                                                format!("Tool execution error: {}", err)
+                                            };
                                             history.push(Message::tool_result(
                                                 &tool_call.id,
-                                                format!("Tool execution error: {}", err),
+                                                feedback,
                                                 true,
                                             ));
                                         }

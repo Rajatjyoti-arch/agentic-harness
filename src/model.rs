@@ -214,7 +214,7 @@ impl Model for OllamaModel {
 
             let chat_res: OllamaChatResponse = res.json().await?;
 
-            let tool_calls: Vec<ToolCall> = chat_res
+            let mut tool_calls: Vec<ToolCall> = chat_res
                 .message
                 .tool_calls
                 .into_iter()
@@ -225,6 +225,61 @@ impl Model for OllamaModel {
                     arguments: tc.function.arguments,
                 })
                 .collect();
+
+            // Robust fallback for local models that output JSON tool calls in message.content
+            if tool_calls.is_empty()
+                && let Some(ref text) = chat_res.message.content
+            {
+                let trimmed = text.trim();
+                let cleaned = if let Some(stripped) = trimmed.strip_prefix("```json") {
+                    stripped.strip_suffix("```").unwrap_or(stripped).trim()
+                } else if let Some(stripped) = trimmed.strip_prefix("```") {
+                    stripped.strip_suffix("```").unwrap_or(stripped).trim()
+                } else {
+                    trimmed
+                };
+
+                let stream = serde_json::Deserializer::from_str(cleaned).into_iter::<Value>();
+                for val in stream.flatten() {
+                    if let Some(obj) = val.as_object() {
+                        if let (Some(name_val), Some(args_val)) =
+                            (obj.get("name"), obj.get("arguments"))
+                            && let Some(name_str) = name_val.as_str()
+                        {
+                            let args = if let Some(s) = args_val.as_str() {
+                                serde_json::from_str(s).unwrap_or_else(|_| args_val.clone())
+                            } else {
+                                args_val.clone()
+                            };
+                            let idx = tool_calls.len();
+                            tool_calls.push(ToolCall {
+                                id: format!("call_{idx}"),
+                                name: name_str.to_string(),
+                                arguments: args,
+                            });
+                        }
+                    } else if let Some(arr) = val.as_array() {
+                        for item in arr {
+                            if let (Some(name_val), Some(args_val)) =
+                                (item.get("name"), item.get("arguments"))
+                                && let Some(name_str) = name_val.as_str()
+                            {
+                                let args = if let Some(s) = args_val.as_str() {
+                                    serde_json::from_str(s).unwrap_or_else(|_| args_val.clone())
+                                } else {
+                                    args_val.clone()
+                                };
+                                let idx = tool_calls.len();
+                                tool_calls.push(ToolCall {
+                                    id: format!("call_{idx}"),
+                                    name: name_str.to_string(),
+                                    arguments: args,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
 
             let stop_reason = match chat_res.done_reason.as_deref() {
                 Some("length") => Some(StopReason::Length),

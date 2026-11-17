@@ -205,10 +205,10 @@ impl ScopedRunner {
                     return Err(std::io::Error::last_os_error());
                 }
 
-                // RLIMIT_AS: 2 GiB virtual address space ceiling
+                // RLIMIT_AS: 8 GiB virtual address space ceiling (necessary for modern LLVM/lld multi-threaded linking)
                 let as_limit = libc::rlimit {
-                    rlim_cur: 2 * 1024 * 1024 * 1024,
-                    rlim_max: 2 * 1024 * 1024 * 1024,
+                    rlim_cur: 8 * 1024 * 1024 * 1024,
+                    rlim_max: 8 * 1024 * 1024 * 1024,
                 };
                 let _ = libc::setrlimit(libc::RLIMIT_AS, &as_limit);
 

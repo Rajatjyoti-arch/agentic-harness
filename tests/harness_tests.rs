@@ -807,7 +807,7 @@ edition = "2021"
     )
     .unwrap();
 
-    // Read-only verifier test suite
+    // Read-only verifier test suite with held-out cases: zero-variance, negative-variance, large scale
     fs::write(
         workspace.join("tests/reconcile_test.rs"),
         r#"use reconciliation_fixture::calculate_variance;
@@ -820,6 +820,16 @@ fn test_variance_under_disbursement() {
 #[test]
 fn test_variance_exact_match() {
     assert_eq!(calculate_variance(10000, 10000), 0);
+}
+
+#[test]
+fn test_variance_over_disbursement() {
+    assert_eq!(calculate_variance(3000, 4500), -1500);
+}
+
+#[test]
+fn test_variance_large_scale() {
+    assert_eq!(calculate_variance(100_000_000, 50_000_000), 50_000_000);
 }
 "#,
     )
@@ -956,9 +966,317 @@ fn test_variance_exact_match() {
         } => {
             assert!(!*is_error);
             assert!(content.contains("AUTOMATED VERIFICATION PASSED"));
-            assert!(content.contains("test result: ok. 2 passed"));
+            assert!(content.contains("test result: ok. 4 passed"));
         }
         other => panic!("Expected ToolResult at index 7, got: {:?}", other),
+    }
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_part_a_fail_closed_allow_on_run_command_rejected() {
+    let workspace = setup_test_workspace("fail_closed_allow_cmd");
+    let runner = Arc::new(ScopedRunner::new(&workspace));
+    let cancel = CancellationToken::new();
+
+    // Defective policy that attempts to return Allow instead of AllowCommand for run_command
+    struct DefectivePolicy;
+    impl Policy for DefectivePolicy {
+        #[allow(clippy::if_same_then_else)]
+        fn evaluate(&self, call: &ToolCall, _tool: &dyn Tool) -> PolicyDecision {
+            if call.name == "run_command" {
+                PolicyDecision::Allow // ILLEGAL: must return AllowCommand
+            } else {
+                PolicyDecision::Allow
+            }
+        }
+    }
+
+    let policy = DefectivePolicy;
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(RunCommandTool::new(
+        runner,
+        Arc::new(DefaultPolicy::new(&workspace)),
+        cancel.clone(),
+    ))];
+
+    let model = MockModel::with_responses(vec![
+        Message::assistant(
+            Some("Trying run_command with defective allow policy...".to_string()),
+            vec![ToolCall {
+                id: "call_defective".to_string(),
+                name: "run_command".to_string(),
+                arguments: json!({ "cmd": "cargo", "args": ["--version"] }),
+            }],
+        ),
+        Message::assistant_text("Task finished after rejection."),
+    ]);
+
+    let output = run_agent(
+        &model,
+        &tools,
+        "Test fail closed on illegal Allow decision",
+        &policy,
+        4,
+        cancel,
+    )
+    .await
+    .unwrap();
+
+    // Verify the illegal Allow decision was caught and rejected as invariant violation
+    match &output.history[3] {
+        Message::ToolResult {
+            content, is_error, ..
+        } => {
+            assert!(*is_error);
+            assert!(
+                content.contains("Security invariant violation"),
+                "Expected invariant violation, got: {}",
+                content
+            );
+            assert!(content.contains("cannot be authorized with PolicyDecision::Allow"));
+        }
+        other => panic!("Expected ToolResult at index 3, got: {:?}", other),
+    }
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_part_a_repair_exhausted_halts_with_distinct_stop_reason() {
+    let workspace = setup_test_workspace("repair_exhausted");
+    let policy = Arc::new(DefaultPolicy::new(&workspace));
+    let runner = Arc::new(ScopedRunner::new(&workspace).with_bwrap(true));
+    let cancel = CancellationToken::new();
+
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::create_dir_all(workspace.join("tests")).unwrap();
+
+    fs::write(
+        workspace.join("Cargo.toml"),
+        r#"[package]
+name = "exhaust_fixture"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        workspace.join("tests/fail_test.rs"),
+        r#"#[test] fn test_always_fail() { panic!("Persistent failure"); }"#,
+    )
+    .unwrap();
+
+    fs::write(workspace.join("src/lib.rs"), "pub fn dummy() {}").unwrap();
+
+    // Prebuild offline metadata
+    let prebuild_auth = policy
+        .validate_command(
+            "cargo",
+            &[
+                "test".to_string(),
+                "--offline".to_string(),
+                "--no-run".to_string(),
+            ],
+        )
+        .unwrap();
+    let _ = runner.execute(&prebuild_auth, &cancel).await.unwrap();
+
+    let tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(WriteFileTool::new(&workspace)),
+        Box::new(RunCommandTool::new(runner, policy.clone(), cancel.clone())),
+    ];
+
+    // Model proposes 3 consecutive broken edits
+    let model = MockModel::with_responses(vec![
+        Message::assistant(
+            None,
+            vec![ToolCall {
+                id: "call_w1".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({ "path": "src/lib.rs", "content": "// edit 1" }),
+            }],
+        ),
+        Message::assistant(
+            None,
+            vec![ToolCall {
+                id: "call_w2".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({ "path": "src/lib.rs", "content": "// edit 2" }),
+            }],
+        ),
+        Message::assistant(
+            None,
+            vec![ToolCall {
+                id: "call_w3".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({ "path": "src/lib.rs", "content": "// edit 3" }),
+            }],
+        ),
+    ]);
+
+    let v_config = VerificationConfig {
+        enabled: true,
+        command: "cargo".to_string(),
+        args: vec!["test".to_string(), "--offline".to_string()],
+        max_repairs: 2, // Limit to 2 repairs
+    };
+
+    let output = run_agent_with_verification(
+        &model,
+        &tools,
+        "Trigger repair exhaustion",
+        policy.as_ref(),
+        Some(v_config),
+        10, // max_turns = 10 (proves it stops at repair budget, not turn limit)
+        cancel,
+    )
+    .await
+    .unwrap();
+
+    // Must halt with distinct StopReason::RepairExhausted, NOT MaxTurns or Stop
+    assert_eq!(output.stop_reason, StopReason::RepairExhausted);
+    assert_eq!(output.turns_executed, 2);
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_part_a_require_approval_blocks_execution() {
+    let workspace = setup_test_workspace("require_approval");
+    let runner = Arc::new(ScopedRunner::new(&workspace));
+    let cancel = CancellationToken::new();
+
+    struct ApprovalPolicy;
+    impl Policy for ApprovalPolicy {
+        fn evaluate(&self, _call: &ToolCall, _tool: &dyn Tool) -> PolicyDecision {
+            PolicyDecision::RequireApproval(
+                "Modification requires administrative sign-off".to_string(),
+            )
+        }
+    }
+
+    let policy = ApprovalPolicy;
+    let tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(WriteFileTool::new(&workspace)),
+        Box::new(RunCommandTool::new(
+            runner,
+            Arc::new(DefaultPolicy::new(&workspace)),
+            cancel.clone(),
+        )),
+    ];
+
+    let target_file = workspace.join("src/should_not_be_written.txt");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+
+    let model = MockModel::with_responses(vec![
+        Message::assistant(
+            None,
+            vec![ToolCall {
+                id: "call_appr".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({ "path": "src/should_not_be_written.txt", "content": "secret" }),
+            }],
+        ),
+        Message::assistant_text("Acknowledged approval requirement."),
+    ]);
+
+    let output = run_agent(&model, &tools, "Test approval gating", &policy, 4, cancel)
+        .await
+        .unwrap();
+
+    // Assert tool was blocked
+    assert!(
+        !target_file.exists(),
+        "File was written despite RequireApproval!"
+    );
+
+    match &output.history[3] {
+        Message::ToolResult {
+            content, is_error, ..
+        } => {
+            assert!(*is_error);
+            assert!(content.contains("Policy requires human approval"));
+            assert!(content.contains("administrative sign-off"));
+        }
+        other => panic!("Expected ToolResult at index 3, got: {:?}", other),
+    }
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_part_b_formatting_repair_retry_bounded_cap_one() {
+    let workspace = setup_test_workspace("format_retry_cap");
+    let policy = DefaultPolicy::new(&workspace);
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(WriteFileTool::new(&workspace))];
+    let cancel = CancellationToken::new();
+
+    // Turn 1: Model emits malformed args (missing required 'content' field)
+    let turn1_call = Message::assistant(
+        Some("Proposing malformed write_file call...".to_string()),
+        vec![ToolCall {
+            id: "call_bad_fmt1".to_string(),
+            name: "write_file".to_string(),
+            arguments: json!({ "path": "src/lib.rs" }), // missing "content"
+        }],
+    );
+
+    // Turn 2: Model receives corrective schema observation and fixes arguments
+    let turn2_call = Message::assistant(
+        Some("Correcting arguments based on schema feedback...".to_string()),
+        vec![ToolCall {
+            id: "call_good_fmt".to_string(),
+            name: "write_file".to_string(),
+            arguments: json!({ "path": "src/lib.rs", "content": "pub fn fixed() {}" }),
+        }],
+    );
+
+    let turn3_resp = Message::assistant_text("Formatting repaired successfully.");
+
+    let model = MockModel::with_responses(vec![turn1_call, turn2_call, turn3_resp]);
+
+    let output = run_agent(
+        &model,
+        &tools,
+        "Test bounded formatting retry",
+        &policy,
+        6,
+        cancel,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.turns_executed, 3);
+    assert_eq!(output.stop_reason, StopReason::Stop);
+
+    // Check Turn 1 response received corrective schema observation
+    match &output.history[3] {
+        Message::ToolResult {
+            content, is_error, ..
+        } => {
+            assert!(*is_error);
+            assert!(
+                content.contains("Argument Formatting Error"),
+                "Expected formatting error observation, got: {}",
+                content
+            );
+            assert!(content.contains("Formatting Retry 1/1"));
+            assert!(content.contains("parameter schema:"));
+        }
+        other => panic!("Expected ToolResult at index 3, got: {:?}", other),
+    }
+
+    // Check Turn 2 write succeeded
+    match &output.history[5] {
+        Message::ToolResult {
+            content, is_error, ..
+        } => {
+            assert!(!*is_error);
+            assert!(content.contains("+pub fn fixed() {}"));
+        }
+        other => panic!("Expected ToolResult at index 5, got: {:?}", other),
     }
 
     let _ = fs::remove_dir_all(&workspace);

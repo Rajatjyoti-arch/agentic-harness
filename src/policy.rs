@@ -11,8 +11,8 @@ pub struct AuthorizedCall {
 }
 
 impl AuthorizedCall {
-    /// Internal constructor, accessible only within this crate during policy validation.
-    pub(crate) fn new(exe: String, args: Vec<String>) -> Self {
+    /// Private constructor, accessible ONLY within `src/policy.rs` during policy validation.
+    fn new(exe: String, args: Vec<String>) -> Self {
         Self { exe, args }
     }
 

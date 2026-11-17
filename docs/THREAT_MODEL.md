@@ -62,11 +62,17 @@ When Bubblewrap (`bwrap`) is active:
 
 ---
 
-## 3. Empirical Verification Evidence (bwrap & cargo test)
+## 3. Empirical Verification Evidence & Confinement Boundaries
 
-- **`RLIMIT_AS` (2 GiB):** Empirically verified sufficient for `cargo test --offline` compilation and test execution on Rust 1.99.1 without triggering out-of-memory aborts.
-- **`CARGO_HOME` Location & Offline Operation:** When `$HOME` is masked with tmpfs, Cargo operates with `$HOME/.cargo` on tmpfs. In `--offline` mode on crates with vendored or cached dependencies, Cargo builds and tests without external network requests or host `$HOME` dependencies.
-- **Target Directory:** Build outputs write to `<workspace>/target`, which resides cleanly within the bind-mounted workspace.
+### A. Zero-Dependency Fixture Verification
+- **Verified Environment:** Confinement and self-repair loops were empirically verified using a zero-dependency Cargo fixture crate (`reconciliation_fixture`) under offline compilation (`cargo test --offline`).
+- **`RLIMIT_AS` (2 GiB Ceiling):** Verified sufficient for compiling and running unit tests on zero-dependency fixtures without triggering out-of-memory aborts.
+- **`CARGO_HOME` on tmpfs:** When `$HOME` is masked by an empty tmpfs, Cargo operates with `$HOME/.cargo` in temporary memory, avoiding access to the host user's personal Cargo configuration or registry cache.
+
+### B. Confirmed Confinement Boundaries & Non-Supported Workloads
+1. **No External Registry Dependencies:** Because network namespaces are unshared (`--unshare-all`) and `$HOME/.cargo` is an empty tmpfs, the sandboxed runner cannot fetch or download external crates from `crates.io`. Projects requiring third-party crates must have dependencies pre-vendored or pre-built before entering the sandbox.
+2. **No Path Dependencies Outside Workspace:** Path dependencies resolving outside the declared workspace jail (e.g. `../agentic-harness` from a consumer crate) do not exist inside the container because only `<workspace>` is bind-mounted. All source code and local dependencies must reside within the workspace tree.
+3. **Memory Limits for Large Real-World Crates:** Empirical evidence for `RLIMIT_AS = 2 GiB` is strictly limited to small fixture crates. Complex procedural macros and heavy linking trees (e.g. `tokio`, `serde_derive`, `wasm-bindgen`) may require larger virtual address space limits or pre-warmed target caches.
 
 ---
 
