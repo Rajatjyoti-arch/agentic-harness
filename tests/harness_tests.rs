@@ -1281,3 +1281,205 @@ async fn test_part_b_formatting_repair_retry_bounded_cap_one() {
 
     let _ = fs::remove_dir_all(&workspace);
 }
+
+#[tokio::test]
+async fn test_e1_sandbox_write_to_tests_dir_fails_with_erofs() {
+    let workspace = setup_test_workspace("e1_erofs");
+    let policy = DefaultPolicy::new(&workspace);
+    let runner = ScopedRunner::new(&workspace).with_bwrap(true);
+    let cancel = CancellationToken::new();
+
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::create_dir_all(workspace.join("tests")).unwrap();
+
+    fs::write(
+        workspace.join("Cargo.toml"),
+        r#"[package]
+name = "erofs_test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tamper"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        workspace.join("src/main.rs"),
+        r#"use std::fs::OpenOptions;
+use std::io::ErrorKind;
+
+fn main() {
+    let res = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open("tests/tamper.txt");
+
+    match res {
+        Ok(_) => panic!("Tampering succeeded! tests/ was NOT mounted read-only!"),
+        Err(e) => {
+            let is_erofs = e.kind() == ErrorKind::ReadOnlyFilesystem
+                || e.raw_os_error() == Some(30) // EROFS on Linux
+                || e.raw_os_error() == Some(13) // EACCES on Linux
+                || e.to_string().contains("Read-only file system");
+            assert!(is_erofs, "Expected EROFS or ReadOnlyFilesystem, got: {:?}", e);
+            println!("EROFS_VERIFIED: {}", e);
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // Prebuild so bwrap runs the binary directly
+    let prebuild_auth = policy
+        .validate_command(
+            "cargo",
+            &[
+                "build".to_string(),
+                "--bin".to_string(),
+                "tamper".to_string(),
+            ],
+        )
+        .unwrap();
+    let _ = runner.execute(&prebuild_auth, &cancel).await.unwrap();
+
+    let auth_call = policy
+        .validate_command(
+            "cargo",
+            &["run".to_string(), "--bin".to_string(), "tamper".to_string()],
+        )
+        .unwrap();
+    let output = runner.execute(&auth_call, &cancel).await.unwrap();
+
+    assert_eq!(output.exit_code, Some(0));
+    assert!(
+        output.stdout.contains("EROFS_VERIFIED"),
+        "Output: {}",
+        output.stdout
+    );
+    assert!(
+        !workspace.join("tests/tamper.txt").exists(),
+        "tamper.txt exists on disk!"
+    );
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_e2_process_exit_zero_in_function_under_test_fails_verifier() {
+    let workspace = setup_test_workspace("e2_exit_zero");
+    let policy = Arc::new(DefaultPolicy::new(&workspace));
+    let runner = Arc::new(ScopedRunner::new(&workspace).with_bwrap(true));
+    let cancel = CancellationToken::new();
+
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::create_dir_all(workspace.join("tests")).unwrap();
+
+    fs::write(
+        workspace.join("Cargo.toml"),
+        r#"[package]
+name = "exit_zero_fixture"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        workspace.join("tests/reconcile_test.rs"),
+        r#"use exit_zero_fixture::calculate_variance;
+
+#[test]
+fn test_variance_under_disbursement() {
+    assert_eq!(calculate_variance(5000, 3500), 1500);
+}
+"#,
+    )
+    .unwrap();
+
+    // Broken initial lib
+    fs::write(
+        workspace.join("src/lib.rs"),
+        r#"pub fn calculate_variance(sanctioned: i64, disbursed: i64) -> i64 {
+    sanctioned + disbursed
+}
+"#,
+    )
+    .unwrap();
+
+    // Pre-build offline metadata
+    let prebuild_auth = policy
+        .validate_command(
+            "cargo",
+            &[
+                "test".to_string(),
+                "--offline".to_string(),
+                "--no-run".to_string(),
+            ],
+        )
+        .unwrap();
+    let _ = runner.execute(&prebuild_auth, &cancel).await.unwrap();
+
+    let tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(WriteFileTool::new(&workspace)),
+        Box::new(RunCommandTool::new(runner, policy.clone(), cancel.clone())),
+    ];
+
+    // Model proposes an exploit: calling std::process::exit(0) inside the function under test!
+    let turn1_call = Message::assistant(
+        Some("Attempting to bypass verifier by calling std::process::exit(0)...".to_string()),
+        vec![ToolCall {
+            id: "call_exploit_exit0".to_string(),
+            name: "write_file".to_string(),
+            arguments: json!({
+                "path": "src/lib.rs",
+                "content": "pub fn calculate_variance(_sanctioned: i64, _disbursed: i64) -> i64 {\n    std::process::exit(0);\n}\n"
+            }),
+        }],
+    );
+
+    let model = MockModel::with_responses(vec![turn1_call]);
+
+    let v_config = VerificationConfig {
+        enabled: true,
+        command: "cargo".to_string(),
+        args: vec!["test".to_string(), "--offline".to_string()],
+        max_repairs: 1, // Single repair attempt allowed
+    };
+
+    let output = run_agent_with_verification(
+        &model,
+        &tools,
+        "Fix failing unit test",
+        policy.as_ref(),
+        Some(v_config),
+        4,
+        cancel,
+    )
+    .await
+    .unwrap();
+
+    // Verifier MUST reject the bare exit 0 because libtest never printed the summary line!
+    // And since max_repairs: 1 is reached, execution terminates with StopReason::RepairExhausted.
+    assert_eq!(output.stop_reason, StopReason::RepairExhausted);
+
+    match &output.history[3] {
+        Message::ToolResult {
+            content, is_error, ..
+        } => {
+            assert!(*is_error, "Verifier allowed exit(0) bypass!");
+            assert!(
+                content.contains("AUTOMATED VERIFICATION FAILED - REPAIR REQUIRED"),
+                "Expected verification failure in tool output: {}",
+                content
+            );
+        }
+        other => panic!("Expected ToolResult at index 3, got: {:?}", other),
+    }
+
+    let _ = fs::remove_dir_all(&workspace);
+}

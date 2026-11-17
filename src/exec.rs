@@ -119,7 +119,10 @@ impl ScopedRunner {
                 }
             }
 
-            // Minimal /etc read-only
+            // /etc read-only: required for Cargo/rustc linker resolution
+            // (/etc/alternatives on Debian/Ubuntu), dynamic linker config
+            // (/etc/ld.so.conf, /etc/ld.so.cache), and timezone/locale
+            // (/etc/localtime). Mounted read-only; no secrets reside here.
             if Path::new("/etc").exists() {
                 bwrap_args.extend([
                     "--ro-bind".to_string(),
@@ -157,6 +160,21 @@ impl ScopedRunner {
                 "--bind".to_string(),
                 self.workspace_root.to_string_lossy().into_owned(),
                 self.workspace_root.to_string_lossy().into_owned(),
+            ]);
+
+            // Overlay tests/ as read-only at the kernel level so sandboxed
+            // processes cannot tamper with the verifier test suite, even via
+            // direct syscalls that bypass the policy gate.
+            let tests_dir = self.workspace_root.join("tests");
+            if tests_dir.is_dir() {
+                bwrap_args.extend([
+                    "--ro-bind".to_string(),
+                    tests_dir.to_string_lossy().into_owned(),
+                    tests_dir.to_string_lossy().into_owned(),
+                ]);
+            }
+
+            bwrap_args.extend([
                 "--chdir".to_string(),
                 self.workspace_root.to_string_lossy().into_owned(),
                 "--unshare-all".to_string(),
@@ -166,6 +184,7 @@ impl ScopedRunner {
             bwrap_args.push("--".to_string());
             bwrap_args.push(program.to_string());
             bwrap_args.extend_from_slice(args);
+            eprintln!("[bwrap argv] bwrap {}", bwrap_args.join(" "));
             ("bwrap".to_string(), bwrap_args)
         } else {
             (program.to_string(), args.to_vec())

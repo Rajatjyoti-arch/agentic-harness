@@ -318,9 +318,9 @@ pub async fn run_with_verification(
                                                             {
                                                                 Ok(v_out) => {
                                                                     let v_dur = v_start.elapsed();
-                                                                    if v_out
-                                                                        .contains("Exit Code: 0")
-                                                                    {
+                                                                    if verify_libtest_summary(
+                                                                        &v_out,
+                                                                    ) {
                                                                         println!(
                                                                             "[Agent Trace] Turn {}: Automated verification PASSED in {:?}",
                                                                             turn, v_dur
@@ -329,7 +329,7 @@ pub async fn run_with_verification(
                                                                     } else {
                                                                         repair_attempts += 1;
                                                                         println!(
-                                                                            "[Agent Trace] Turn {}: Automated verification FAILED (Attempt {}/{}) in {:?}: Exit code non-zero",
+                                                                            "[Agent Trace] Turn {}: Automated verification FAILED (Attempt {}/{}) in {:?}: libtest summary mismatch or test failure",
                                                                             turn,
                                                                             repair_attempts,
                                                                             v_config.max_repairs,
@@ -460,4 +460,90 @@ pub async fn run_with_verification(
         stop_reason: StopReason::MaxTurns,
         turns_executed: max_turns,
     })
+}
+
+/// Parses the libtest summary from verification output.
+///
+/// Returns `true` only when the output contains a valid libtest run:
+/// 1. Every suite that ran (`running N tests` with N > 0) has a matching
+///    summary line `test result: ok. N passed; 0 failed`.
+/// 2. At least one test suite ran with N > 0.
+/// 3. No test suite reported FAILED or has un-summarized/missing tests.
+///
+/// A process that exits 0 without completing libtest (e.g., via `std::process::exit(0)`)
+/// will either lack the summary line or have a mismatch between tests run and tests passed,
+/// and is strictly rejected as FAILED.
+pub fn verify_libtest_summary(output: &str) -> bool {
+    // If output contains an exit code marker, ensure it is 0
+    if output.contains("Exit Code:") && !output.contains("Exit Code: 0") {
+        return false;
+    }
+
+    let mut current_suite_expected: Option<usize> = None;
+    let mut total_passed = 0usize;
+    let mut completed_suites = 0usize;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+
+        // Detect "running N tests" or "running 1 test"
+        if let Some(rest) = trimmed.strip_prefix("running ")
+            && let Some(idx) = rest.find(" test")
+            && let Ok(count) = rest[..idx].trim().parse::<usize>()
+        {
+            // If a previous suite started with count > 0 but didn't finish,
+            // that means it was aborted (e.g. exit(0)) before printing summary!
+            if let Some(prev) = current_suite_expected
+                && prev > 0
+            {
+                return false;
+            }
+            current_suite_expected = Some(count);
+        }
+
+        // Detect summary line: "test result: ok. N passed; 0 failed; ..."
+        if let Some(rest) = trimmed.strip_prefix("test result: ") {
+            if let Some(summary) = rest.strip_prefix("ok. ") {
+                let parts: Vec<&str> = summary.split(';').collect();
+                if parts.len() >= 2 {
+                    let passed_part = parts[0].trim();
+                    let failed_part = parts[1].trim();
+                    let passed_count = passed_part
+                        .split_whitespace()
+                        .next()
+                        .and_then(|n| n.parse::<usize>().ok());
+                    let failed_count = failed_part
+                        .split_whitespace()
+                        .next()
+                        .and_then(|n| n.parse::<usize>().ok());
+
+                    if let (Some(passed), Some(0)) = (passed_count, failed_count) {
+                        if let Some(expected) = current_suite_expected
+                            && passed != expected
+                        {
+                            return false;
+                        }
+                        total_passed += passed;
+                        completed_suites += 1;
+                        current_suite_expected = None;
+                    } else {
+                        return false;
+                    }
+                }
+            } else {
+                // If it starts with "test result: FAILED" or anything not "ok."
+                return false;
+            }
+        }
+    }
+
+    // If a suite started with expected > 0 but was cut short without summary line:
+    if let Some(expected) = current_suite_expected
+        && expected > 0
+    {
+        return false;
+    }
+
+    // Require at least one suite to have completed and at least 1 test passed
+    completed_suites > 0 && total_passed > 0
 }

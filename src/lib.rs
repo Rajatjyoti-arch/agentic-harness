@@ -8,7 +8,7 @@ pub mod types;
 pub use exec::{ExecutionError, ExecutionOutput, ScopedRunner};
 pub use r#loop::{
     AgentError, AgentOutput, VerificationConfig, run as run_agent,
-    run_with_verification as run_agent_with_verification,
+    run_with_verification as run_agent_with_verification, verify_libtest_summary,
 };
 pub use model::{BoxFuture, MockModel, Model, ModelError, OllamaModel};
 pub use policy::{
