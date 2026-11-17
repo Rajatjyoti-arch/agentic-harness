@@ -10,7 +10,7 @@ pub use r#loop::{
     AgentError, AgentOutput, VerificationConfig, extract_test_names, run as run_agent,
     run_with_verification as run_agent_with_verification, verify_libtest_summary,
 };
-pub use model::{BoxFuture, MockModel, Model, ModelError, OllamaModel};
+pub use model::{BoxFuture, MockModel, Model, ModelError, OllamaConfig, OllamaModel};
 pub use policy::{
     ALLOWED_EXECUTABLES, AuthorizedCall, BLOCKED_INTERPRETERS, DefaultPolicy, Policy,
     PolicyDecision, is_bwrap_available,

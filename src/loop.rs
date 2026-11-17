@@ -87,6 +87,7 @@ pub async fn run_with_verification(
         "[Agent Trace] Initializing agent loop for task: \"{}\"",
         task
     );
+    println!("[Agent Trace] Model request options: num_ctx=8192, temperature=0.2");
     println!(
         "[Agent Trace] Registered tools: {:?}",
         tool_definitions.iter().map(|t| &t.name).collect::<Vec<_>>()
@@ -125,21 +126,80 @@ pub async fn run_with_verification(
             println!("[Agent Trace] Run cancelled by token.");
             return Ok(AgentOutput {
                 history,
-                stop_reason: StopReason::Error,
+                stop_reason: StopReason::Cancelled,
                 turns_executed: turn,
             });
         }
 
         println!("\n[Agent Trace] === Turn {} / {} ===", turn, max_turns);
 
-        let assistant_msg = model.respond(&history, &tool_definitions).await?;
+        let model_res = tokio::select! {
+            res = model.respond(&history, &tool_definitions) => res,
+            _ = cancel_token.cancelled() => {
+                println!("[Agent Trace] Turn {}: Cancelled mid-model call.", turn);
+                return Ok(AgentOutput {
+                    history,
+                    stop_reason: StopReason::Cancelled,
+                    turns_executed: turn,
+                });
+            }
+        };
+
+        let mut assistant_msg = match model_res {
+            Ok(msg) => msg,
+            Err(ModelError::Transport(ref e)) if e.is_timeout() => {
+                println!("[Agent Trace] Turn {}: Model provider timed out.", turn);
+                return Ok(AgentOutput {
+                    history,
+                    stop_reason: StopReason::ProviderTimeout,
+                    turns_executed: turn,
+                });
+            }
+            Err(ModelError::Timeout(_)) => {
+                println!("[Agent Trace] Turn {}: Model provider timed out.", turn);
+                return Ok(AgentOutput {
+                    history,
+                    stop_reason: StopReason::ProviderTimeout,
+                    turns_executed: turn,
+                });
+            }
+            Err(err) => return Err(AgentError::Model(err)),
+        };
+
+        // Enforce consistent per-turn unique tool call IDs: call_{turn}_{index}
+        if let Message::Assistant {
+            ref mut tool_calls, ..
+        } = assistant_msg
+        {
+            for (idx, tc) in tool_calls.iter_mut().enumerate() {
+                tc.id = format!("call_{turn}_{idx}");
+            }
+        }
 
         match &assistant_msg {
             Message::Assistant {
                 content,
                 tool_calls,
                 stop_reason,
+                prompt_eval_count,
             } => {
+                if let Some(count) = prompt_eval_count {
+                    println!("[Agent Trace] Turn {}: prompt_eval_count: {}", turn, count);
+                    // Abort with distinct StopReason::ContextNearLimit above 90% of num_ctx (8192 * 0.9 = 7372)
+                    if *count > (8192 * 9 / 10) {
+                        println!(
+                            "[Agent Trace] Turn {}: ABORT: prompt_eval_count ({}) exceeded 90% of num_ctx (7372). Stopping with ContextNearLimit.",
+                            turn, count
+                        );
+                        history.push(assistant_msg.clone());
+                        return Ok(AgentOutput {
+                            history,
+                            stop_reason: StopReason::ContextNearLimit,
+                            turns_executed: turn,
+                        });
+                    }
+                }
+
                 if let Some(text) = content {
                     println!(
                         "[Agent Trace] Turn {}: Assistant thought/message:\n{}",
@@ -165,6 +225,21 @@ pub async fn run_with_verification(
                 history.push(assistant_msg.clone());
 
                 if tool_calls.is_empty() {
+                    if let Some(text) = content
+                        && crate::model::has_concatenated_objects(text)
+                        && format_retry_count < 1
+                    {
+                        format_retry_count += 1;
+                        println!(
+                            "[Agent Trace] Turn {}: Concatenated JSON objects rejected. Triggering format repair retry 1/1.",
+                            turn
+                        );
+                        history.push(Message::user(
+                            "Formatting Error: Concatenated tool calls are rejected. Please emit only a single JSON tool call object per turn (Formatting Retry 1/1)."
+                        ));
+                        continue;
+                    }
+
                     println!(
                         "[Agent Trace] Turn {}: No tools requested. Task complete.",
                         turn

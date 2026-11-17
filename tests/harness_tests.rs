@@ -1,8 +1,8 @@
 use agentic_harness::{
-    DefaultPolicy, ExecutionError, ListDirArgs, ListDirTool, Message, MockModel, Policy,
-    PolicyDecision, ReadFileArgs, ReadFileTool, RunCommandArgs, RunCommandTool, ScopedRunner,
-    StopReason, Tool, ToolCall, VerificationConfig, WriteFileArgs, WriteFileTool, run_agent,
-    run_agent_with_verification,
+    BoxFuture, DefaultPolicy, ExecutionError, ListDirArgs, ListDirTool, Message, MockModel, Model,
+    ModelError, OllamaConfig, OllamaModel, Policy, PolicyDecision, ReadFileArgs, ReadFileTool,
+    RunCommandArgs, RunCommandTool, ScopedRunner, StopReason, Tool, ToolCall, ToolDefinition,
+    VerificationConfig, WriteFileArgs, WriteFileTool, run_agent, run_agent_with_verification,
 };
 use serde_json::json;
 use std::fs;
@@ -341,7 +341,7 @@ async fn test_t5_policy_deny_produces_error_observation_and_loop_continues() {
             content,
             is_error,
         } => {
-            assert_eq!(tool_call_id, "call_deny_1");
+            assert_eq!(tool_call_id, "call_1_0");
             assert!(
                 *is_error,
                 "Expected ToolResult.is_error to be true for policy denial"
@@ -1979,6 +1979,380 @@ mod tests {
         }
         other => panic!("Expected ToolResult at index 3, got: {:?}", other),
     }
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_h1b_sandboxed_write_exceeding_tmpfs_size_fails_with_enospc() {
+    if !agentic_harness::is_bwrap_available() {
+        eprintln!(
+            "Skipping test_h1b_sandboxed_write_exceeding_tmpfs_size_fails_with_enospc: bwrap not available"
+        );
+        return;
+    }
+
+    let workspace = setup_test_workspace("h1b_enospc");
+    let runner = Arc::new(ScopedRunner::new(&workspace));
+    let policy: Arc<dyn Policy> = Arc::new(DefaultPolicy::new(&workspace));
+    let cancel = CancellationToken::new();
+
+    let cargo_toml = r#"[package]
+name = "tmpfs_overflow_test"
+version = "0.1.0"
+edition = "2024"
+"#;
+    let src_lib = r#"
+pub fn run_overflow() -> Result<(), std::io::Error> {
+    use std::io::Write;
+    // Each file is 32 MB (< 64 MB RLIMIT_FSIZE).
+    // 40 files * 32 MB = 1280 MB (> 1024 MB tmpfs size limit).
+    let chunk = vec![0u8; 32 * 1024 * 1024];
+    for i in 0..40 {
+        let path = format!("/tmp/overflow_test_file_{}.bin", i);
+        let mut file = std::fs::File::create(&path)?;
+        file.write_all(&chunk)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_tmpfs_overflow_fails_enospc() {
+        let err = run_overflow().unwrap_err();
+        eprintln!("[enospc verification] Caught error: {}", err);
+        // On Linux, ENOSPC is errno 28 (No space left on device)
+        assert_eq!(err.raw_os_error(), Some(28), "Expected ENOSPC (os error 28), got: {}", err);
+    }
+}
+"#;
+
+    fs::write(workspace.join("Cargo.toml"), cargo_toml).unwrap();
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(workspace.join("src/lib.rs"), src_lib).unwrap();
+
+    let tool = RunCommandTool::new(runner, policy, cancel);
+    let args = json!({
+        "cmd": "cargo",
+        "args": ["test", "--offline"]
+    });
+
+    let res = tool.run(args).await;
+    assert!(
+        res.is_ok(),
+        "Expected test asserting ENOSPC to pass: {:?}",
+        res
+    );
+    let output = res.unwrap();
+    assert!(
+        output.contains("test tests::test_tmpfs_overflow_fails_enospc ... ok"),
+        "Output: {}",
+        output
+    );
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_b3_provider_timeout_aborts_with_zero_tool_executions() {
+    let workspace = setup_test_workspace("b3_timeout");
+    let policy = DefaultPolicy::new(&workspace);
+    let cancel = CancellationToken::new();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server_task = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop(socket);
+        }
+    });
+
+    let config = OllamaConfig::new(format!("http://127.0.0.1:{}", port), "test-model")
+        .with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
+    let model = OllamaModel::from_config(config).unwrap();
+
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadFileTool::new(&workspace))];
+
+    let start = std::time::Instant::now();
+    let output = run_agent(&model, &tools, "Test timeout behavior", &policy, 3, cancel)
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    server_task.abort();
+
+    assert_eq!(output.stop_reason, StopReason::ProviderTimeout);
+    assert!(
+        elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(3),
+        "Expected timeout in ~1-2s, took {:?}",
+        elapsed
+    );
+    assert!(
+        output
+            .history
+            .iter()
+            .all(|m| !matches!(m, Message::ToolResult { .. }))
+    );
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_b3_cancellation_mid_call_aborts_cleanly() {
+    let workspace = setup_test_workspace("b3_cancel");
+    let policy = DefaultPolicy::new(&workspace);
+    let cancel = CancellationToken::new();
+
+    struct SlowModel;
+    impl Model for SlowModel {
+        fn respond<'a>(
+            &'a self,
+            _history: &'a [Message],
+            _tools: &'a [ToolDefinition],
+        ) -> BoxFuture<'a, Result<Message, ModelError>> {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Ok(Message::assistant_text("Should not be returned"))
+            })
+        }
+    }
+
+    let c = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        c.cancel();
+    });
+
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadFileTool::new(&workspace))];
+    let output = run_agent(
+        &SlowModel,
+        &tools,
+        "Test mid-call cancellation",
+        &policy,
+        3,
+        cancel,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.stop_reason, StopReason::Cancelled);
+    assert!(
+        output
+            .history
+            .iter()
+            .all(|m| !matches!(m, Message::ToolResult { .. }))
+    );
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_c2_distinct_tool_call_ids_and_correlated_results() {
+    let workspace = setup_test_workspace("c2_call_ids");
+    let policy = DefaultPolicy::new(&workspace);
+    let cancel = CancellationToken::new();
+
+    fs::write(workspace.join("file_a.txt"), "Content of File A").unwrap();
+    fs::write(workspace.join("file_b.txt"), "Content of File B").unwrap();
+
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadFileTool::new(&workspace))];
+
+    let turn1_call = Message::assistant(
+        Some("Reading files A and B in parallel".to_string()),
+        vec![
+            ToolCall {
+                id: "arbitrary_model_id_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "file_a.txt" }),
+            },
+            ToolCall {
+                id: "arbitrary_model_id_2".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "file_b.txt" }),
+            },
+        ],
+    );
+    let turn2_resp = Message::assistant_text("Finished reading files.");
+
+    let model = MockModel::with_responses(vec![turn1_call, turn2_resp]);
+    let output = run_agent(&model, &tools, "Read multiple files", &policy, 3, cancel)
+        .await
+        .unwrap();
+
+    assert_eq!(output.stop_reason, StopReason::Stop);
+    assert_eq!(output.turns_executed, 2);
+
+    match &output.history[2] {
+        Message::Assistant { tool_calls, .. } => {
+            assert_eq!(tool_calls.len(), 2);
+            assert_eq!(tool_calls[0].id, "call_1_0");
+            assert_eq!(tool_calls[1].id, "call_1_1");
+            assert_ne!(tool_calls[0].id, tool_calls[1].id);
+        }
+        other => panic!("Expected Assistant message at index 2, got: {:?}", other),
+    }
+
+    match &output.history[3] {
+        Message::ToolResult {
+            tool_call_id,
+            content,
+            is_error,
+        } => {
+            assert_eq!(tool_call_id, "call_1_0");
+            assert!(!*is_error);
+            assert_eq!(content, "Content of File A");
+        }
+        other => panic!("Expected ToolResult at index 3, got: {:?}", other),
+    }
+
+    match &output.history[4] {
+        Message::ToolResult {
+            tool_call_id,
+            content,
+            is_error,
+        } => {
+            assert_eq!(tool_call_id, "call_1_1");
+            assert!(!*is_error);
+            assert_eq!(content, "Content of File B");
+        }
+        other => panic!("Expected ToolResult at index 4, got: {:?}", other),
+    }
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_c3_assistant_describing_tools_in_prose_executes_nothing() {
+    let workspace = setup_test_workspace("c3_prose");
+    let policy = DefaultPolicy::new(&workspace);
+    let cancel = CancellationToken::new();
+
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(workspace.join("src/lib.rs"), "pub fn original() {}").unwrap();
+
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(WriteFileTool::new(&workspace))];
+
+    let turn1_call = Message::assistant_text(
+        "I will now mutate the code by invoking write_file with path: 'src/lib.rs' and content: 'pub fn hacked() {}'.",
+    );
+
+    let model = MockModel::with_responses(vec![turn1_call]);
+    let output = run_agent(&model, &tools, "Describe tool in prose", &policy, 3, cancel)
+        .await
+        .unwrap();
+
+    assert_eq!(output.stop_reason, StopReason::Stop);
+    assert_eq!(output.turns_executed, 1);
+    assert!(
+        output
+            .history
+            .iter()
+            .all(|m| !matches!(m, Message::ToolResult { .. }))
+    );
+
+    let content = fs::read_to_string(workspace.join("src/lib.rs")).unwrap();
+    assert_eq!(content, "pub fn original() {}");
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_c3_concatenated_tool_objects_rejected_triggers_repair_retry() {
+    let workspace = setup_test_workspace("c3_concat");
+    let policy = DefaultPolicy::new(&workspace);
+    let cancel = CancellationToken::new();
+
+    fs::create_dir_all(workspace.join("src")).unwrap();
+
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(WriteFileTool::new(&workspace))];
+
+    let turn1_call = Message::assistant_text(
+        "{\"name\": \"write_file\", \"arguments\": {\"path\": \"src/lib.rs\", \"content\": \"pub fn first() {}\"}}{\"name\": \"write_file\", \"arguments\": {\"path\": \"src/lib.rs\", \"content\": \"pub fn second() {}\"}}",
+    );
+
+    let turn2_call = Message::assistant(
+        Some("Repaired tool formatting.".to_string()),
+        vec![ToolCall {
+            id: "call_repair".to_string(),
+            name: "write_file".to_string(),
+            arguments: json!({ "path": "src/lib.rs", "content": "pub fn corrected() {}" }),
+        }],
+    );
+
+    let turn3_resp = Message::assistant_text("Task completed.");
+
+    let model = MockModel::with_responses(vec![turn1_call, turn2_call, turn3_resp]);
+    let output = run_agent(
+        &model,
+        &tools,
+        "Test concatenated objects rejection",
+        &policy,
+        4,
+        cancel,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.stop_reason, StopReason::Stop);
+    assert_eq!(output.turns_executed, 3);
+
+    match &output.history[3] {
+        Message::User { content } => {
+            assert!(
+                content.contains("Formatting Error: Concatenated tool calls are rejected"),
+                "Expected repair prompt, got: {}",
+                content
+            );
+            assert!(content.contains("Formatting Retry 1/1"));
+        }
+        other => panic!(
+            "Expected corrective User message at index 3, got: {:?}",
+            other
+        ),
+    }
+
+    let content = fs::read_to_string(workspace.join("src/lib.rs")).unwrap();
+    assert_eq!(content, "pub fn corrected() {}");
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn test_c4_context_near_limit_aborts_agent_loop() {
+    let workspace = setup_test_workspace("c4_context_limit");
+    let policy = DefaultPolicy::new(&workspace);
+    let cancel = CancellationToken::new();
+
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadFileTool::new(&workspace))];
+
+    let turn1_call = Message::Assistant {
+        content: Some("Evaluating complex prompt context...".to_string()),
+        tool_calls: vec![ToolCall {
+            id: "call_context_tool".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({ "path": "src/lib.rs" }),
+        }],
+        stop_reason: None,
+        prompt_eval_count: Some(7500),
+    };
+
+    let model = MockModel::with_responses(vec![turn1_call]);
+    let output = run_agent(&model, &tools, "Context limit test", &policy, 3, cancel)
+        .await
+        .unwrap();
+
+    assert_eq!(output.stop_reason, StopReason::ContextNearLimit);
+    assert_eq!(output.turns_executed, 1);
+    assert!(
+        output
+            .history
+            .iter()
+            .all(|m| !matches!(m, Message::ToolResult { .. }))
+    );
 
     let _ = fs::remove_dir_all(&workspace);
 }

@@ -31,7 +31,7 @@ The goal of this security architecture is to provide **fail-closed, type-enforce
   - The test suite and verification logic remain completely immutable to the agent, eliminating the possibility of self-repair cheating (e.g. replacing failing assertions with `assert!(true)` or `exit 0`).
 - **Read-Only Workspace Root in Sandbox:**
   - In bubblewrap, `<workspace_root>` is mounted `--ro-bind` at the kernel level.
-  - Only `<workspace_root>/src` and `<workspace_root>/target` are mounted `--bind` (read-write).
+  - Only `<workspace_root>/src` is mounted `--bind` (read-write).
   - Crucial project files (`Cargo.toml`, `Cargo.lock`, `tests/`, `.cargo/config.toml`, `build.rs`) cannot be altered by test-time code execution; write syscalls fail with `EROFS` (Read-only file system).
 - **Libtest Integrity & Per-Test-Name Matching:**
   - The verifier does not rely on process exit codes alone.
@@ -51,12 +51,18 @@ When Bubblewrap (`bwrap`) is active:
   - `--ro-bind /usr /usr`
   - Symlinks / ro-binds for `/bin`, `/lib`, `/lib64`
   - `--dir /etc` with specific linker/timezone file overlays
-  - `--proc /proc --dev /dev --tmpfs /tmp`
+  - `--proc /proc --dev /dev --size 1073741824 --tmpfs /tmp`
 - **Masking of `$HOME` with tmpfs:**
   - The user's home directory is masked by mounting an empty `--tmpfs` over `$HOME`. Host credentials (`~/.ssh`, `~/.aws`, `~/.config`, `.env`) do not exist inside the sandbox.
   - Secret laundering (reading a host secret inside the sandbox and persisting it into the workspace) is physically impossible because the host filesystem outside `/usr` and `/etc` is not mounted.
-- **Isolated Workspace Mount:**
-  - The workspace root is mounted `--ro-bind`, with only `src/` and `target/` mounted read-write.
+- **Isolated Workspace Mount & Persistence Channel Removal:**
+  - The workspace root is mounted `--ro-bind`, with only `src/` mounted read-write.
+  - `target/` is NOT mounted from the host workspace; `CARGO_TARGET_DIR` is redirected to `/tmp/target` in ephemeral tmpfs. This removed a persistence channel, preventing build-cache poisoning or persistent artifact planting across invocations.
+- **Bounded `/tmp` tmpfs:**
+  - Bubblewrap mounts `/tmp` with `--size 1073741824 --tmpfs /tmp` (1 GiB ceiling), preventing disk or memory exhaustion from runaway sandboxed writes.
+- **Single Named Exception: Sandboxed Lockfile Generation (`src/exec.rs:89-173`):**
+  - If a workspace contains `Cargo.toml` without a `Cargo.lock`, `ScopedRunner::execute_internal` pre-creates an empty `Cargo.lock` on the host and runs `cargo generate-lockfile --offline` in a dedicated bubblewrap jail with `--bind Cargo.lock` before executing user code.
+  - This is an internal prerequisite required by `--locked` when `<workspace_root>` is mounted read-only. It only works for dependency-free crates because `--offline` forbids network access.
 - **Namespace Unsharing:**
   - `--unshare-all` unshares mount, IPC, PID, network, UTS, and cgroup namespaces.
   - Zero network exfiltration surface (network namespace is disconnected).
@@ -68,7 +74,7 @@ When Bubblewrap (`bwrap`) is active:
   - On timeout or `CancellationToken` cancellation, `libc::kill(-pgid, SIGKILL)` terminates the entire process group simultaneously, preventing orphan sleep processes.
   - Reaping via `child.wait().await` prevents zombie processes.
 - **POSIX Resource Limits (`setrlimit`):**
-  - `RLIMIT_AS`: 2 GiB virtual address space ceiling per process.
+  - `RLIMIT_AS`: 4 GiB virtual address space ceiling per process (default, configurable per runner). Note: `RLIMIT_AS` caps virtual address space (VIRT), NOT resident memory (RSS); modern Linux provides no kernel RSS cap via `setrlimit`.
   - `RLIMIT_CPU`: 60s soft limit, 61s hard limit (`SIGKILL`).
   - `RLIMIT_FSIZE`: 64 MB maximum generated file size.
   - `RLIMIT_NPROC`: Inherited from the calling user and never raised (preventing privilege escalation while avoiding Linux `EAGAIN` fork failures).

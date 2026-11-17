@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -12,6 +13,9 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub enum ModelError {
     #[error("HTTP transport error: {0}")]
     Transport(#[from] reqwest::Error),
+
+    #[error("Model provider timeout: {0:?}")]
+    Timeout(Duration),
 
     #[error("JSON serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -70,20 +74,64 @@ impl Model for MockModel {
     }
 }
 
+/// Configuration for Ollama model provider.
+#[derive(Debug, Clone)]
+pub struct OllamaConfig {
+    pub base_url: String,
+    pub model_name: String,
+    pub connect_timeout: Duration,
+    pub request_timeout: Duration,
+    pub num_ctx: usize,
+    pub temperature: f64,
+}
+
+impl OllamaConfig {
+    pub fn new(base_url: impl Into<String>, model_name: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            model_name: model_name.into(),
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(300),
+            num_ctx: 8192,
+            temperature: 0.2,
+        }
+    }
+
+    pub fn with_timeouts(mut self, connect: Duration, request: Duration) -> Self {
+        self.connect_timeout = connect;
+        self.request_timeout = request;
+        self
+    }
+
+    pub fn with_options(mut self, num_ctx: usize, temperature: f64) -> Self {
+        self.num_ctx = num_ctx;
+        self.temperature = temperature;
+        self
+    }
+}
+
 /// Ollama local language model provider communicating over HTTP `/api/chat`.
 pub struct OllamaModel {
     client: reqwest::Client,
-    base_url: String,
-    model_name: String,
+    config: OllamaConfig,
 }
 
 impl OllamaModel {
     pub fn new(base_url: impl Into<String>, model_name: impl Into<String>) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            base_url: base_url.into(),
-            model_name: model_name.into(),
-        }
+        Self::from_config(OllamaConfig::new(base_url, model_name))
+            .expect("Failed to build OllamaModel with default config")
+    }
+
+    pub fn from_config(config: OllamaConfig) -> Result<Self, ModelError> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(config.connect_timeout)
+            .timeout(config.request_timeout)
+            .build()?;
+        Ok(Self { client, config })
+    }
+
+    pub fn config(&self) -> &OllamaConfig {
+        &self.config
     }
 }
 
@@ -94,6 +142,7 @@ struct OllamaChatRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<Value>,
+    options: Value,
 }
 
 #[derive(Deserialize)]
@@ -119,6 +168,8 @@ struct OllamaChatResponse {
     message: OllamaMessageResponse,
     #[serde(default)]
     done_reason: Option<String>,
+    #[serde(default)]
+    prompt_eval_count: Option<usize>,
 }
 
 impl Model for OllamaModel {
@@ -128,7 +179,7 @@ impl Model for OllamaModel {
         tools: &'a [ToolDefinition],
     ) -> BoxFuture<'a, Result<Message, ModelError>> {
         Box::pin(async move {
-            let endpoint = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
+            let endpoint = format!("{}/api/chat", self.config.base_url.trim_end_matches('/'));
 
             let mut messages_payload = Vec::new();
             for msg in history {
@@ -198,10 +249,14 @@ impl Model for OllamaModel {
                 .collect();
 
             let req = OllamaChatRequest {
-                model: &self.model_name,
+                model: &self.config.model_name,
                 messages: messages_payload,
                 stream: false,
                 tools: tools_payload,
+                options: json!({
+                    "num_ctx": self.config.num_ctx,
+                    "temperature": self.config.temperature,
+                }),
             };
 
             let res = self
@@ -214,71 +269,38 @@ impl Model for OllamaModel {
 
             let chat_res: OllamaChatResponse = res.json().await?;
 
-            let mut tool_calls: Vec<ToolCall> = chat_res
-                .message
-                .tool_calls
-                .into_iter()
-                .enumerate()
-                .map(|(idx, tc)| ToolCall {
-                    id: format!("call_{idx}"),
-                    name: tc.function.name,
-                    arguments: tc.function.arguments,
-                })
-                .collect();
+            let turn = history
+                .iter()
+                .filter(|m| matches!(m, Message::Assistant { .. }))
+                .count()
+                + 1;
 
-            // Robust fallback for local models that output JSON tool calls in message.content
-            if tool_calls.is_empty()
-                && let Some(ref text) = chat_res.message.content
+            let (tool_calls, path_used) = if !chat_res.message.tool_calls.is_empty() {
+                let tcs: Vec<ToolCall> = chat_res
+                    .message
+                    .tool_calls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, tc)| ToolCall {
+                        id: format!("call_{turn}_{idx}"),
+                        name: tc.function.name,
+                        arguments: tc.function.arguments,
+                    })
+                    .collect();
+                (tcs, "native message.tool_calls")
+            } else if let Some(ref text) = chat_res.message.content
+                && let Some(parsed) = parse_single_tool_call_from_text(text, turn)
             {
-                let trimmed = text.trim();
-                let cleaned = if let Some(stripped) = trimmed.strip_prefix("```json") {
-                    stripped.strip_suffix("```").unwrap_or(stripped).trim()
-                } else if let Some(stripped) = trimmed.strip_prefix("```") {
-                    stripped.strip_suffix("```").unwrap_or(stripped).trim()
-                } else {
-                    trimmed
-                };
+                (vec![parsed], "text fallback (single JSON object)")
+            } else {
+                (Vec::new(), "none")
+            };
 
-                let stream = serde_json::Deserializer::from_str(cleaned).into_iter::<Value>();
-                for val in stream.flatten() {
-                    if let Some(obj) = val.as_object() {
-                        if let (Some(name_val), Some(args_val)) =
-                            (obj.get("name"), obj.get("arguments"))
-                            && let Some(name_str) = name_val.as_str()
-                        {
-                            let args = if let Some(s) = args_val.as_str() {
-                                serde_json::from_str(s).unwrap_or_else(|_| args_val.clone())
-                            } else {
-                                args_val.clone()
-                            };
-                            let idx = tool_calls.len();
-                            tool_calls.push(ToolCall {
-                                id: format!("call_{idx}"),
-                                name: name_str.to_string(),
-                                arguments: args,
-                            });
-                        }
-                    } else if let Some(arr) = val.as_array() {
-                        for item in arr {
-                            if let (Some(name_val), Some(args_val)) =
-                                (item.get("name"), item.get("arguments"))
-                                && let Some(name_str) = name_val.as_str()
-                            {
-                                let args = if let Some(s) = args_val.as_str() {
-                                    serde_json::from_str(s).unwrap_or_else(|_| args_val.clone())
-                                } else {
-                                    args_val.clone()
-                                };
-                                let idx = tool_calls.len();
-                                tool_calls.push(ToolCall {
-                                    id: format!("call_{idx}"),
-                                    name: name_str.to_string(),
-                                    arguments: args,
-                                });
-                            }
-                        }
-                    }
-                }
+            if path_used != "none" {
+                println!(
+                    "[Agent Trace] Turn {}: Tool dispatch protocol: {}",
+                    turn, path_used
+                );
             }
 
             let stop_reason = match chat_res.done_reason.as_deref() {
@@ -292,7 +314,116 @@ impl Model for OllamaModel {
                 content: chat_res.message.content,
                 tool_calls,
                 stop_reason,
+                prompt_eval_count: chat_res.prompt_eval_count,
             })
         })
     }
+}
+
+/// Parses a single tool call JSON object from assistant message text if present.
+///
+/// Strict rules:
+/// - Accepts ONLY a single JSON object that is either the entire message (trimmed)
+///   or inside a single fenced code block (` ```json ... ``` ` or ` ``` ... ``` `).
+/// - Does NOT extract tool calls described in prose.
+/// - Rejects concatenated objects (e.g. `{"name": "a"}{"name": "b"}`).
+pub fn parse_single_tool_call_from_text(text: &str, turn: usize) -> Option<ToolCall> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // 1. Check if the entire message is a single JSON object
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        if let Ok(val) = serde_json::from_str::<Value>(trimmed)
+            && let Some(obj) = val.as_object()
+            && let Some(name_val) = obj.get("name")
+            && let Some(name_str) = name_val.as_str()
+        {
+            let args = match obj.get("arguments") {
+                Some(Value::String(s)) => {
+                    serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone()))
+                }
+                Some(other) => other.clone(),
+                None => json!({}),
+            };
+            return Some(ToolCall {
+                id: format!("call_{turn}_0"),
+                name: name_str.to_string(),
+                arguments: args,
+            });
+        }
+        return None;
+    }
+
+    // 2. Check for a single fenced code block
+    if let Some(start_idx) = trimmed.find("```") {
+        let after_open = &trimmed[start_idx + 3..];
+        let block_start = if let Some(rest) = after_open.strip_prefix("json") {
+            rest
+        } else {
+            after_open
+        };
+        if let Some(end_idx) = block_start.find("```") {
+            let code_content = block_start[..end_idx].trim();
+            let after_close = &block_start[end_idx + 3..];
+            // Ensure no extra fences and that code_content is a single JSON object
+            if !after_close.contains("```")
+                && code_content.starts_with('{')
+                && code_content.ends_with('}')
+                && let Ok(val) = serde_json::from_str::<Value>(code_content)
+                && let Some(obj) = val.as_object()
+                && let Some(name_val) = obj.get("name")
+                && let Some(name_str) = name_val.as_str()
+            {
+                let args = match obj.get("arguments") {
+                    Some(Value::String(s)) => {
+                        serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone()))
+                    }
+                    Some(other) => other.clone(),
+                    None => json!({}),
+                };
+                return Some(ToolCall {
+                    id: format!("call_{turn}_0"),
+                    name: name_str.to_string(),
+                    arguments: args,
+                });
+            }
+        }
+    }
+
+    None
+}
+
+/// Detects if text contains multiple/concatenated JSON objects.
+pub fn has_concatenated_objects(text: &str) -> bool {
+    let trimmed = text.trim();
+    let content_to_check = if let Some(start_idx) = trimmed.find("```") {
+        let after_open = &trimmed[start_idx + 3..];
+        let block_start = if let Some(rest) = after_open.strip_prefix("json") {
+            rest
+        } else {
+            after_open
+        };
+        if let Some(end_idx) = block_start.find("```") {
+            block_start[..end_idx].trim()
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+    };
+
+    let stream = serde_json::Deserializer::from_str(content_to_check).into_iter::<Value>();
+    let mut count = 0;
+    for item in stream {
+        if let Ok(val) = item {
+            if val.is_object() {
+                count += 1;
+            }
+        } else {
+            break;
+        }
+    }
+    count > 1
 }

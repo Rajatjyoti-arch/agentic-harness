@@ -28,6 +28,8 @@ pub enum Message {
         tool_calls: Vec<ToolCall>,
         #[serde(skip_serializing_if = "Option::is_none")]
         stop_reason: Option<StopReason>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_eval_count: Option<usize>,
     },
     /// Result returned to the model after tool execution.
     #[serde(rename = "tool")]
@@ -57,6 +59,7 @@ impl Message {
             content,
             tool_calls,
             stop_reason: None,
+            prompt_eval_count: None,
         }
     }
 
@@ -69,6 +72,20 @@ impl Message {
             content,
             tool_calls,
             stop_reason,
+            prompt_eval_count: None,
+        }
+    }
+
+    pub fn assistant_with_eval_count(
+        content: Option<String>,
+        tool_calls: Vec<ToolCall>,
+        prompt_eval_count: Option<usize>,
+    ) -> Self {
+        Self::Assistant {
+            content,
+            tool_calls,
+            stop_reason: None,
+            prompt_eval_count,
         }
     }
 
@@ -77,6 +94,7 @@ impl Message {
             content: Some(content.into()),
             tool_calls: Vec::new(),
             stop_reason: None,
+            prompt_eval_count: None,
         }
     }
 
@@ -109,6 +127,12 @@ pub enum StopReason {
     MaxTurns,
     /// Loop stopped due to an unrecoverable model or execution error.
     Error,
+    /// Model provider request timed out.
+    ProviderTimeout,
+    /// Execution cancelled cooperatively.
+    Cancelled,
+    /// Context window usage exceeded safe threshold (>90% num_ctx).
+    ContextNearLimit,
 }
 
 /// Schema definition of a tool made available to the model.

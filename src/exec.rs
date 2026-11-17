@@ -35,6 +35,7 @@ pub struct ScopedRunner {
     default_timeout: Duration,
     max_output_bytes: usize,
     use_bwrap: bool,
+    rlimit_as: u64,
 }
 
 impl ScopedRunner {
@@ -45,6 +46,7 @@ impl ScopedRunner {
             default_timeout: Duration::from_secs(30),
             max_output_bytes: 512 * 1024, // 512 KB
             use_bwrap: is_bwrap_available(),
+            rlimit_as: 4 * 1024 * 1024 * 1024, // 4 GiB default virtual address space ceiling
         }
     }
 
@@ -63,6 +65,12 @@ impl ScopedRunner {
     /// Configures whether bubblewrap isolation is enabled.
     pub fn with_bwrap(mut self, enabled: bool) -> Self {
         self.use_bwrap = enabled;
+        self
+    }
+
+    /// Configures the maximum virtual address space limit (RLIMIT_AS) in bytes.
+    pub fn with_rlimit_as(mut self, limit_bytes: u64) -> Self {
+        self.rlimit_as = limit_bytes;
         self
     }
 
@@ -143,6 +151,8 @@ impl ScopedRunner {
                     "/proc".to_string(),
                     "--dev".to_string(),
                     "/dev".to_string(),
+                    "--size".to_string(),
+                    "1073741824".to_string(),
                     "--tmpfs".to_string(),
                     "/tmp".to_string(),
                     "--ro-bind".to_string(),
@@ -228,12 +238,14 @@ impl ScopedRunner {
                 }
             }
 
-            // Standard runtime mounts: proc, dev, tmpfs over /tmp
+            // Standard runtime mounts: proc, dev, 1 GiB bounded tmpfs over /tmp
             bwrap_args.extend([
                 "--proc".to_string(),
                 "/proc".to_string(),
                 "--dev".to_string(),
                 "/dev".to_string(),
+                "--size".to_string(),
+                "1073741824".to_string(),
                 "--tmpfs".to_string(),
                 "/tmp".to_string(),
             ]);
@@ -310,9 +322,10 @@ impl ScopedRunner {
         cmd.env("CARGO_TARGET_DIR", "/tmp/target");
 
         // 3. Process Group Leader & POSIX Resource Limits via pre_exec
+        let rlimit_as = self.rlimit_as;
         #[cfg(unix)]
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 // Isolate child into its own process group to prevent orphan leaks
                 if libc::setpgid(0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
@@ -327,10 +340,10 @@ impl ScopedRunner {
                     return Err(std::io::Error::last_os_error());
                 }
 
-                // RLIMIT_AS: 8 GiB virtual address space ceiling (necessary for modern LLVM/lld multi-threaded linking)
+                // RLIMIT_AS: Configurable virtual address space ceiling (default 4 GiB)
                 let as_limit = libc::rlimit {
-                    rlim_cur: 8 * 1024 * 1024 * 1024,
-                    rlim_max: 8 * 1024 * 1024 * 1024,
+                    rlim_cur: rlimit_as,
+                    rlim_max: rlimit_as,
                 };
                 let _ = libc::setrlimit(libc::RLIMIT_AS, &as_limit);
 
